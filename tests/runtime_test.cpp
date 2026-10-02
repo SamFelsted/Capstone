@@ -24,14 +24,26 @@ class FakeHal final : public melty::Hal {
   melty::MotorOutput written{};
   bool acceleration_ok{true};
   bool rc_ok{true};
+  melty::Micros acceleration_read_advance_us{0};
+  melty::Micros rc_read_advance_us{0};
+  bool timestamp_acceleration_on_read{false};
+  bool timestamp_rc_on_read{false};
   unsigned writes{0};
 
   melty::Micros now_us() override { return now; }
   bool read_acceleration(melty::AccelerationSample& value) override {
+    now += acceleration_read_advance_us;
+    if (timestamp_acceleration_on_read) {
+      acceleration.timestamp_us = now;
+    }
     value = acceleration;
     return acceleration_ok;
   }
   bool read_rc(melty::RcCommand& value) override {
+    now += rc_read_advance_us;
+    if (timestamp_rc_on_read) {
+      command.timestamp_us = now;
+    }
     value = command;
     return rc_ok;
   }
@@ -181,12 +193,65 @@ void test_numeric_fail_closed() {
           "non-finite derived controller state must disarm and write safe output");
 }
 
+void test_acquisition_timestamp_semantics() {
+  FakeHal hal;
+  melty::RuntimeConfig config{};
+  melty::Runtime runtime(hal, config);
+  hal.now = 1000;
+  hal.command.arm = false;
+  hal.command.spin = 0.0;
+  hal.acceleration_read_advance_us = 200;
+  hal.rc_read_advance_us = 300;
+  hal.timestamp_acceleration_on_read = true;
+  hal.timestamp_rc_on_read = true;
+  runtime.tick();
+  require(!has(runtime.status().faults, melty::Fault::stale_acceleration) &&
+              !has(runtime.status().faults, melty::Fault::stale_rc) &&
+              !has(runtime.status().faults, melty::Fault::control_deadline) &&
+              runtime.status().now_us == 1500 &&
+              runtime.status().last_tick_us == 1500,
+          "same-tick acquisition-completion timestamps must be accepted");
+  hal.now = 1400;
+  runtime.tick();
+  require(has(runtime.status().faults, melty::Fault::control_deadline) &&
+              runtime.status().last_tick_us == 1500,
+          "backward tick-entry clock must fault without regressing last tick");
+
+  FakeHal slow_hal;
+  melty::RuntimeConfig slow_config{};
+  slow_config.maximum_tick_interval_us = 2000;
+  melty::Runtime slow_runtime(slow_hal, slow_config);
+  slow_hal.now = 1000;
+  slow_hal.command.arm = false;
+  slow_hal.acceleration_read_advance_us = 1500;
+  slow_hal.rc_read_advance_us = 1000;
+  slow_hal.timestamp_acceleration_on_read = true;
+  slow_hal.timestamp_rc_on_read = true;
+  slow_runtime.tick();
+  require(has(slow_runtime.status().faults, melty::Fault::control_deadline) &&
+              slow_hal.written.wheel_a == 0.0 &&
+              slow_hal.written.wheel_b == 0.0,
+          "slow HAL acquisition must count against control deadline");
+
+  FakeHal future_hal;
+  melty::Runtime future_runtime(future_hal, config);
+  future_hal.now = 1000;
+  future_hal.acceleration.timestamp_us = 1001;
+  future_hal.command.timestamp_us = 1000;
+  future_hal.command.arm = false;
+  future_runtime.tick();
+  require(has(future_runtime.status().faults,
+              melty::Fault::stale_acceleration),
+          "timestamp beyond post-read clock must still be rejected");
+}
+
 }  // namespace
 
 int main() {
   test_pwm_frame_assembly();
   test_hardware_enable_handshake();
   test_numeric_fail_closed();
+  test_acquisition_timestamp_semantics();
 
   const melty::BoardProfile esp = melty::esp32_devkit_reference_profile();
   const melty::BoardProfile teensy = melty::teensy41_reference_profile();

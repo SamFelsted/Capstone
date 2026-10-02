@@ -68,13 +68,14 @@ void Runtime::disarm(Fault fault) {
 }
 
 void Runtime::tick() {
-  const Micros now = hal_.now_us();
+  const Micros entry_us = hal_.now_us();
   Fault active_faults = Fault::none;
   if (!valid_config(config_)) {
     active_faults |= Fault::invalid_configuration;
   }
-  if (now < status_.last_tick_us ||
-      now - status_.last_tick_us > config_.maximum_tick_interval_us) {
+  const bool entry_clock_valid = entry_us >= status_.last_tick_us;
+  if (!entry_clock_valid ||
+      entry_us - status_.last_tick_us > config_.maximum_tick_interval_us) {
     active_faults |= Fault::control_deadline;
   }
 
@@ -90,11 +91,6 @@ void Runtime::tick() {
       active_faults |= Fault::acceleration_saturated;
     }
   }
-  if (!fresh(now, acceleration_.timestamp_us,
-             config_.acceleration_timeout_us)) {
-    active_faults |= Fault::stale_acceleration;
-  }
-
   RcCommand new_command{};
   if (!hal_.read_rc(new_command)) {
     active_faults |= Fault::hal_error;
@@ -104,11 +100,27 @@ void Runtime::tick() {
     command_ = new_command;
     status_.last_rc_us = command_.timestamp_us;
   }
-  if (!fresh(now, command_.timestamp_us, config_.rc_timeout_us)) {
+  // HAL reads may advance the clock and timestamp samples at acquisition
+  // completion. Freshness and control therefore use a clock sampled after both
+  // reads, while the entry sample above preserves inter-tick deadline meaning.
+  const Micros acquisition_complete_us = hal_.now_us();
+  const bool acquisition_clock_valid =
+      entry_clock_valid && acquisition_complete_us >= entry_us;
+  if (!acquisition_clock_valid ||
+      acquisition_complete_us - status_.last_tick_us >
+          config_.maximum_tick_interval_us) {
+    active_faults |= Fault::control_deadline;
+  }
+  if (!fresh(acquisition_complete_us, acceleration_.timestamp_us,
+             config_.acceleration_timeout_us)) {
+    active_faults |= Fault::stale_acceleration;
+  }
+  if (!fresh(acquisition_complete_us, command_.timestamp_us,
+             config_.rc_timeout_us)) {
     active_faults |= Fault::stale_rc;
   }
 
-  status_.now_us = now;
+  status_.now_us = acquisition_complete_us;
   status_.faults = active_faults;
   const Fault fatal_faults =
       Fault::invalid_configuration | Fault::invalid_acceleration |
@@ -134,7 +146,7 @@ void Runtime::tick() {
         have_arm_frame_ = true;
       }
       if (command_.reset_phase) {
-        controller_.reset(now, 0.0);
+        controller_.reset(acquisition_complete_us, 0.0);
       }
     } else if (!status_.arm_interlock_satisfied) {
       status_.armed = false;
@@ -151,7 +163,8 @@ void Runtime::tick() {
     }
 
     MotorOutput requested =
-        controller_.update(now, acceleration_, command_, status_.armed);
+        controller_.update(acquisition_complete_us, acceleration_, command_,
+                           status_.armed);
     if (!controller_.numeric_valid()) {
       disarm(Fault::controller_numeric);
       requested = {};
@@ -163,7 +176,11 @@ void Runtime::tick() {
 
   status_.controller = controller_.telemetry();
   hal_.write_motors(status_.output);
-  status_.last_tick_us = now;
+  // Never move the recorded monotonic boundary backwards. A long but monotonic
+  // acquisition is recorded so a recovered runtime can begin a new handshake.
+  if (acquisition_clock_valid) {
+    status_.last_tick_us = acquisition_complete_us;
+  }
 }
 
 }  // namespace melty

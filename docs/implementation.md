@@ -15,9 +15,14 @@ conditional anti-windup.
 ## Time, phase, and arming
 
 All public timestamps are unsigned integer microseconds on one monotonic epoch.
-An input timestamp is acquisition time, not delivery time. A sample from the
-future, one older than its configured timeout, a non-finite value, or a control
-tick after the deadline disarms in that tick. Board HALs must extend Arduino's
+An input timestamp is acquisition-completion time, not tick-entry or delivery
+time. Runtime samples the clock at tick entry to check continuity from the prior
+valid acquisition completion, then again after both HAL reads. The post-read
+time governs freshness, controller integration, status `now_us`, and the next
+`last_tick_us`; read duration therefore counts against the control deadline.
+Backward time, a sample later than the post-read clock, one older than its
+configured timeout, a non-finite value, or a control tick after the deadline
+disarms in that tick. Board HALs must extend Arduino's
 wrapping 32-bit `micros()` result to 64 bits. The simulator clock starts at zero
 and advances only by `advance_ticks` or `advance_for`.
 `RuntimeConfig::control_period_us` is the nominal firmware cadence; the simulator
