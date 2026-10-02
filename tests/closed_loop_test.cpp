@@ -172,6 +172,20 @@ int main() {
   require(std::isfinite(bounded.snapshot().x_m),
           "accepted bounded configuration must advance promptly and finitely");
 
+  for (const double stiffness : {3'000.0, 30'000.0}) {
+    melty::sim::SimulationConfig fast_tick{};
+    fast_tick.physics_tick_us = 1;
+    fast_tick.sensor.sample_period_us = 1'000;
+    fast_tick.firmware.control_period_us = 1'000;
+    fast_tick.physical.tire_longitudinal_stiffness_n_per_mps = stiffness;
+    require(melty::sim::Simulator::validate(fast_tick).empty(),
+            "validation should accept stiffness resolvable at the configured tick");
+    melty::sim::Simulator fast_simulator(fast_tick);
+    fast_simulator.advance_ticks(1);
+    require(std::isfinite(fast_simulator.snapshot().spin_rad_s),
+            "every validated timestep/configuration pair must construct and advance");
+  }
+
   melty::sim::SimulationConfig saturated_config{};
   saturated_config.sensor.noise_stddev_mps2 = 0.0;
   saturated_config.sensor.max_acceleration_mps2 = 15.0;

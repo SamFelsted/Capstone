@@ -188,9 +188,7 @@ class Plant::Impl {
 
 Plant::Plant(const PhysicalConfig& config)
     : impl_(std::make_unique<Impl>(config)) {
-  std::size_t count = 0;
-  if (!supported_physical_config(config) ||
-      !substep_count(config, 0.00025, count)) {
+  if (!supported_physical_config(config)) {
     throw std::invalid_argument("unsupported physical configuration");
   }
 }
