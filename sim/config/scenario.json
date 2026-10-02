@@ -1,0 +1,40 @@
+{
+  "schema": "meltybrain-simulator",
+  "version": 1,
+  "config": {
+    "physical": {
+      "mass_kg": 1.36, "body_radius_m": 0.09, "moment_of_inertia_kg_m2": 0.0055,
+      "wheel_radius_m": 0.02, "wheel_offset_m": 0.065,
+      "motor_torque_constant_nm_per_a": 0.006, "motor_back_emf_v_per_rad_s": 0.006,
+      "motor_resistance_ohm": 0.35, "gear_ratio": 1.0, "drivetrain_efficiency": 0.85,
+      "motor_inertia_kg_m2": 0.000008, "motor_current_limit_a": 30.0,
+      "motor_time_constant_s": 0.025, "tire_friction_coefficient": 0.8,
+      "tire_longitudinal_stiffness_n_per_mps": 30.0, "linear_drag_n_per_mps": 0.15,
+      "angular_drag_nm_per_rad_s": 0.0008, "battery_voltage": 8.4
+    },
+    "sensor": {
+      "radius_m": 0.025, "angle_rad": 0.0, "max_acceleration_mps2": 980.665,
+      "noise_stddev_mps2": 0.5, "bias_x_mps2": 0.0, "bias_y_mps2": 0.0,
+      "sample_period_us": 1000, "latency_us": 500
+    },
+    "firmware": {
+      "control_period_us": 1000, "acceleration_timeout_us": 25000, "rc_timeout_us": 100000,
+      "maximum_tick_interval_us": 20000, "arm_spin_max": 0.05, "arm_confirm_ticks": 3,
+      "controller": {
+        "sensor_radius_m": 0.024, "sensor_angle_rad": 0.04, "spin_direction": 1,
+        "minimum_phase_spin_rad_s": 20.0, "radial_accel_floor_mps2": 10.0,
+        "radial_accel_filter_hz": 25.0, "maximum_spin_rad_s": 450.0,
+        "spin_kp": 0.012, "spin_ki": 0.1, "spin_integrator_limit": 0.45,
+        "command_headroom": 0.08, "translation_gain": 0.45,
+        "translation_phase_offset_rad": 2.15
+      }
+    },
+    "physics_tick_us": 250, "command_latency_us": 2000, "actuator_latency_us": 1000,
+    "scenario_seed": 2026
+  },
+  "initial_state": {
+    "x_m": -0.25, "y_m": 0.1, "heading_rad": 0.5,
+    "vx_mps": 0.0, "vy_mps": 0.0, "spin_rad_s": 0.0,
+    "estimated_phase_rad": -0.2
+  }
+}
