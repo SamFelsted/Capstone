@@ -43,6 +43,7 @@ class Runtime {
   RcCommand command_{};
   unsigned arm_ticks_{0};
   Micros last_arm_frame_us_{0};
+  bool have_arm_frame_{false};
 };
 
 }  // namespace melty

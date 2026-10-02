@@ -29,15 +29,23 @@ int integer_magnitude(int value) { return value < 0 ? -value : value; }
 ArduinoReferenceHal* ArduinoReferenceHal::instance_ = nullptr;
 
 ArduinoReferenceHal::ArduinoReferenceHal(const BoardProfile& profile)
-    : profile_(profile) {}
+    : profile_(profile),
+      rc_assembler_({profile.rc_min_us, profile.rc_center_us,
+                     profile.rc_max_us, kRcElectricalMinUs,
+                     kRcElectricalMaxUs, kRcCaptureTimeoutUs}) {}
 
 bool ArduinoReferenceHal::begin() {
   ready_ = false;
+  outputs_configured_ = false;
+  if (!valid_board_profile(profile_)) {
+    return false;
+  }
   instance_ = this;
   pinMode(profile_.enable_pin, INPUT_PULLDOWN);
   pinMode(profile_.esc_a_pin, OUTPUT);
   pinMode(profile_.esc_b_pin, OUTPUT);
   configure_pwm();
+  outputs_configured_ = true;
   write_esc(profile_.esc_a_pin, 0, profile_.esc_safe_us);
   write_esc(profile_.esc_b_pin, 1, profile_.esc_safe_us);
 
@@ -163,11 +171,15 @@ void ArduinoReferenceHal::on_rc_edge(unsigned channel) {
   const std::uint32_t now = micros();
   if (digitalRead(pins[channel]) != LOW) {
     rc_rise_us_[channel] = now;
-  } else {
+    rc_have_rise_[channel] = true;
+  } else if (rc_have_rise_[channel]) {
     const std::uint32_t width = now - rc_rise_us_[channel];
+    rc_have_rise_[channel] = false;
     if (width >= kRcElectricalMinUs && width <= kRcElectricalMaxUs) {
       rc_pulse_us_[channel] = width;
       rc_end_us_[channel] = now;
+      ++rc_sequence_[channel];
+      rc_have_pulse_[channel] = true;
     }
   }
 }
@@ -178,53 +190,24 @@ void ArduinoReferenceHal::rc_isr_2() { instance_->on_rc_edge(2); }
 void ArduinoReferenceHal::rc_isr_3() { instance_->on_rc_edge(3); }
 void ArduinoReferenceHal::rc_isr_4() { instance_->on_rc_edge(4); }
 
-double ArduinoReferenceHal::normalized_unipolar(std::uint32_t pulse_us) const {
-  const double span = profile_.rc_max_us - profile_.rc_min_us;
-  const double value = (static_cast<double>(pulse_us) - profile_.rc_min_us) / span;
-  return std::max(0.0, std::min(1.0, value));
-}
-
-double ArduinoReferenceHal::normalized_centered(std::uint32_t pulse_us) const {
-  if (pulse_us >= profile_.rc_center_us) {
-    const double span = profile_.rc_max_us - profile_.rc_center_us;
-    return std::min(1.0, (pulse_us - profile_.rc_center_us) / span);
-  }
-  const double span = profile_.rc_center_us - profile_.rc_min_us;
-  return std::max(-1.0, -static_cast<double>(profile_.rc_center_us - pulse_us) / span);
-}
-
 bool ArduinoReferenceHal::read_rc(RcCommand& command) {
   if (!ready_) {
     return false;
   }
-  std::uint32_t pulse[5]{};
-  std::uint32_t ended[5]{};
+  PwmRcCapture capture{};
   noInterrupts();
   for (unsigned i = 0; i < 5; ++i) {
-    pulse[i] = rc_pulse_us_[i];
-    ended[i] = rc_end_us_[i];
+    capture.pulse_us[i] = rc_pulse_us_[i];
+    capture.ended_us[i] = rc_end_us_[i];
+    capture.sequence[i] = rc_sequence_[i];
+    capture.have_pulse[i] = rc_have_pulse_[i];
   }
   interrupts();
 
-  const Micros now = now_us();
-  const std::uint32_t now_raw = static_cast<std::uint32_t>(now);
-  Micros oldest = now;
-  for (unsigned i = 0; i < 5; ++i) {
-    const std::uint32_t age = now_raw - ended[i];
-    if (pulse[i] < kRcElectricalMinUs || pulse[i] > kRcElectricalMaxUs ||
-        ended[i] == 0 || age > kRcCaptureTimeoutUs) {
-      return false;
-    }
-    oldest = std::min(oldest, now - age);
-  }
-  command.spin = normalized_unipolar(pulse[0]);
-  command.translate_x = normalized_centered(pulse[1]);
-  command.translate_y = normalized_centered(pulse[2]);
-  command.arm = pulse[3] > profile_.rc_center_us &&
-                digitalRead(profile_.enable_pin) == HIGH;
-  command.reset_phase = pulse[4] > profile_.rc_center_us;
-  command.timestamp_us = oldest;
-  return true;
+  capture.now_us = now_us();
+  capture.now_raw_us = static_cast<std::uint32_t>(capture.now_us);
+  capture.hardware_enabled = digitalRead(profile_.enable_pin) == HIGH;
+  return rc_assembler_.update(capture, command);
 }
 
 void ArduinoReferenceHal::configure_pwm() {
@@ -254,6 +237,9 @@ void ArduinoReferenceHal::write_esc(std::uint8_t pin, unsigned channel,
 }
 
 void ArduinoReferenceHal::write_motors(const MotorOutput& output) {
+  if (!outputs_configured_) {
+    return;
+  }
   const bool hardware_enabled = ready_ && digitalRead(profile_.enable_pin) == HIGH;
   const double a = hardware_enabled && std::isfinite(output.wheel_a)
                        ? std::max(0.0, std::min(1.0, output.wheel_a))

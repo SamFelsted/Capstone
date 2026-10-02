@@ -7,6 +7,7 @@
 
 #include "melty/board_profile.hpp"
 #include "melty/hal.hpp"
+#include "melty/rc_pwm_input.hpp"
 
 namespace melty {
 
@@ -34,19 +35,22 @@ class ArduinoReferenceHal final : public Hal {
   bool read_acceleration_registers();
   void configure_pwm();
   void write_esc(std::uint8_t pin, unsigned channel, std::uint16_t pulse_us);
-  double normalized_unipolar(std::uint32_t pulse_us) const;
-  double normalized_centered(std::uint32_t pulse_us) const;
 
   BoardProfile profile_{};
   bool ready_{false};
+  bool outputs_configured_{false};
   bool have_acceleration_{false};
   std::uint32_t last_micros_raw_{0};
   std::uint64_t micros_high_{0};
   AccelerationSample latest_acceleration_{};
+  PwmRcFrameAssembler rc_assembler_{};
 
   volatile std::uint32_t rc_rise_us_[5]{};
   volatile std::uint32_t rc_pulse_us_[5]{};
   volatile std::uint32_t rc_end_us_[5]{};
+  volatile std::uint32_t rc_sequence_[5]{};
+  volatile bool rc_have_rise_[5]{};
+  volatile bool rc_have_pulse_[5]{};
 };
 
 }  // namespace melty

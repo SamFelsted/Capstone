@@ -54,12 +54,24 @@ fresh disarmed RC frame with spin at or below `arm_spin_max`, followed by
 `arm_confirm_ticks` fresh armed frames. Dropping arm, stale data, bad values, HAL
 failure, or a deadline miss clears the handshake and writes zero.
 After any such event the disarmed-then-armed sequence is required again.
+The physical hardware-enable input is carried separately from the RC arm switch.
+Dropping hardware enable clears the handshake, and raising it while RC arm is
+still high cannot establish the interlock; the receiver must provide a real
+arm-low frame while hardware is enabled before subsequent arm-high frames count.
+PWM channels are captured asynchronously, but the HAL advances `RcCommand`'s
+timestamp only after every required channel has produced a new complete pulse.
+Partial channel updates reuse the previous complete-frame timestamp and cannot
+advance the arming confirmation count.
 Accelerometer clipping is explicit in `AccelerationSample::saturated`; runtime
 reports `acceleration_saturated` and disarms instead of treating the clipped
 magnitude as a trustworthy low-speed measurement.
 On healthy disarmed ticks the estimator continues integrating phase while the PI
 integrator and motor terms are held at zero. This preserves coast-down state
 without reusing stale torque when the arm handshake is completed again.
+Controller configuration rejects sensor radii below 1 micrometer, and each
+derived control stage checks finiteness. A finite input that overflows during
+projection, estimation, integration, or mixing produces zero output,
+`controller_numeric`, and a cleared arm handshake rather than NaN telemetry.
 
 ## Public classes
 
@@ -99,7 +111,9 @@ The ESP32 DevKit reference uses I2C SDA/SCL 21/22, RC spin/X/Y/arm/reset pins
 reference uses fixed Wire SDA/SCL 18/19, RC pins 2/3/4/5/6, ESC pins 7/8, and
 enable pin 9. Both assume 1000/1500/2000 us RC endpoints, forward-only
 1000--2000 us ESC input, the H3LIS331DL +/-100 g range at 0.47884 m/s^2 per
-12-bit count, and sensor axes configured by `sensor_angle_rad`. The physical
+12-bit count, a conservative illustrative 150 rad/s maximum command below the
+sensor's roughly 198 rad/s clipping point at 25 mm radius, and sensor axes
+configured by `sensor_angle_rad`. The physical
 enable inputs use internal pulldowns; production wiring needs an external
 fail-safe bias and an independent kill path.
 
@@ -108,3 +122,6 @@ robot-ready safety system. Hardware selection is unresolved. Before physical
 use, validate electrical levels, interrupt latency, failsafe behavior, ESC arming
 requirements, mechanical containment, vibration isolation, and a tested external
 kill path.
+The software deadline check can react only when `tick()` resumes; it cannot
+protect against a hung processor. An independent watchdog that directly forces
+safe output, along with the external kill path, remains required hardware work.

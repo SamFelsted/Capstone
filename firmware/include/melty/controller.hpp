@@ -34,12 +34,16 @@ class Controller {
                      const RcCommand& command, bool output_enabled = true);
 
   const ControllerTelemetry& telemetry() const { return telemetry_; }
+  bool numeric_valid() const { return numeric_valid_; }
 
  private:
+  MotorOutput fail_numeric();
+
   ControllerConfig config_{};
   ControllerTelemetry telemetry_{};
   Micros last_update_us_{0};
   bool initialized_{false};
+  bool numeric_valid_{true};
 };
 
 }  // namespace melty

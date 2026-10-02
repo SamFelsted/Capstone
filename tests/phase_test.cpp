@@ -1,6 +1,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 
 #include "melty/controller.hpp"
 
@@ -105,6 +106,27 @@ int main() {
   (void)tangential_only.update(0, tangential_acceleration, command);
   require(tangential_only.telemetry().spin_rad_s == 0.0,
           "tangential acceleration must not masquerade as centripetal spin");
+
+  melty::ControllerConfig tiny_radius = config;
+  tiny_radius.sensor_radius_m = std::numeric_limits<double>::denorm_min();
+  require(!melty::Controller::valid_config(tiny_radius),
+          "computationally unsafe denormal sensor radius must be rejected");
+
+  melty::ControllerConfig extreme_config = config;
+  extreme_config.sensor_radius_m = 1.0e-6;
+  melty::Controller extreme(extreme_config);
+  extreme.reset(0);
+  melty::AccelerationSample extreme_acceleration{};
+  extreme_acceleration.x_mps2 = -std::numeric_limits<double>::max();
+  const melty::MotorOutput extreme_output =
+      extreme.update(0, extreme_acceleration, maximum);
+  require(!extreme.numeric_valid(),
+          "finite inputs producing non-finite derived state must fail closed");
+  require(extreme_output.wheel_a == 0.0 && extreme_output.wheel_b == 0.0 &&
+              std::isfinite(extreme.telemetry().phase_rad) &&
+              std::isfinite(extreme.telemetry().spin_rad_s) &&
+              !extreme.telemetry().phase_valid,
+          "numeric failure must retain finite telemetry and safe output");
 
   std::cout << "phase_test passed\n";
   return 0;

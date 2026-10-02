@@ -28,6 +28,7 @@ struct BoardProfile {
 };
 
 // These are reference wiring/calibration profiles, not robot-ready defaults.
+bool valid_board_profile(const BoardProfile& profile);
 BoardProfile esp32_devkit_reference_profile();
 BoardProfile teensy41_reference_profile();
 

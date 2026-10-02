@@ -25,6 +25,10 @@ struct RcCommand {
   bool arm{false};
   bool reset_phase{false};
   Micros timestamp_us{0};
+  // A separate hardware gate. It must never be synthesized from the RC arm
+  // channel: runtime requires both, and only a real RC arm-low frame can reset
+  // the arm interlock.
+  bool hardware_enabled{true};
 };
 
 struct MotorOutput {
@@ -45,6 +49,7 @@ enum class Fault : std::uint32_t {
   phase_invalid = 1u << 6,
   hal_error = 1u << 7,
   acceleration_saturated = 1u << 8,
+  controller_numeric = 1u << 9,
 };
 
 constexpr Fault operator|(Fault lhs, Fault rhs) {

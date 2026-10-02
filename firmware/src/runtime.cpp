@@ -50,6 +50,7 @@ void Runtime::reset(double phase_reference_rad) {
   command_ = {};
   arm_ticks_ = 0;
   last_arm_frame_us_ = 0;
+  have_arm_frame_ = false;
   controller_.reset(status_.now_us, phase_reference_rad);
   status_.controller = controller_.telemetry();
   hal_.write_motors({});
@@ -60,6 +61,8 @@ void Runtime::disarm(Fault fault) {
   status_.armed = false;
   status_.arm_interlock_satisfied = false;
   arm_ticks_ = 0;
+  last_arm_frame_us_ = command_.timestamp_us;
+  have_arm_frame_ = true;
   controller_.disable_output();
   status_.output = {};
 }
@@ -115,11 +118,21 @@ void Runtime::tick() {
   if (any(active_faults & all_fatal_faults)) {
     disarm(active_faults);
   } else {
-    if (!command_.arm) {
+    if (!command_.hardware_enabled) {
+      status_.armed = false;
+      status_.arm_interlock_satisfied = false;
+      arm_ticks_ = 0;
+      last_arm_frame_us_ = command_.timestamp_us;
+      have_arm_frame_ = true;
+    } else if (!command_.arm) {
       status_.armed = false;
       arm_ticks_ = 0;
-      status_.arm_interlock_satisfied = command_.spin <= config_.arm_spin_max;
-      last_arm_frame_us_ = command_.timestamp_us;
+      if (!have_arm_frame_ || command_.timestamp_us != last_arm_frame_us_) {
+        status_.arm_interlock_satisfied =
+            command_.spin <= config_.arm_spin_max;
+        last_arm_frame_us_ = command_.timestamp_us;
+        have_arm_frame_ = true;
+      }
       if (command_.reset_phase) {
         controller_.reset(now, 0.0);
       }
@@ -127,18 +140,22 @@ void Runtime::tick() {
       status_.armed = false;
       arm_ticks_ = 0;
     } else if (!status_.armed) {
-      if (command_.timestamp_us != last_arm_frame_us_) {
+      if (!have_arm_frame_ || command_.timestamp_us != last_arm_frame_us_) {
         ++arm_ticks_;
         last_arm_frame_us_ = command_.timestamp_us;
+        have_arm_frame_ = true;
       }
       if (arm_ticks_ >= config_.arm_confirm_ticks) {
         status_.armed = true;
       }
     }
 
-    const MotorOutput requested =
+    MotorOutput requested =
         controller_.update(now, acceleration_, command_, status_.armed);
-    if (!controller_.telemetry().phase_valid) {
+    if (!controller_.numeric_valid()) {
+      disarm(Fault::controller_numeric);
+      requested = {};
+    } else if (!controller_.telemetry().phase_valid) {
       status_.faults |= Fault::phase_invalid;
     }
     status_.output = requested;
