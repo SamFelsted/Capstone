@@ -1,0 +1,10 @@
+.venv/
+build*/
+.pio/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.so
+*.dylib
+.DS_Store
+runs/
