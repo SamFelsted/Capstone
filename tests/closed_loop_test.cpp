@@ -110,6 +110,68 @@ int main() {
   }
   require(rejected_nan, "non-finite user commands must be rejected");
 
+  const auto before_bad_reset = simulator.snapshot();
+  bool rejected_unsafe_reset = false;
+  try {
+    melty::sim::ResetState unsafe{};
+    unsafe.vx_mps = std::numeric_limits<double>::max();
+    simulator.reset(unsafe);
+  } catch (const std::invalid_argument&) {
+    rejected_unsafe_reset = true;
+  }
+  const auto after_bad_reset = simulator.snapshot();
+  require(rejected_unsafe_reset &&
+              before_bad_reset.time_us == after_bad_reset.time_us &&
+              before_bad_reset.x_m == after_bad_reset.x_m &&
+              before_bad_reset.spin_rad_s == after_bad_reset.spin_rad_s,
+          "unsafe reset must be rejected transactionally");
+
+  for (const double sign : {-1.0, 1.0}) {
+    melty::sim::ResetState boundary{};
+    boundary.x_m = sign * 1.0e6;
+    boundary.y_m = -sign * 1.0e6;
+    boundary.heading_rad = sign * 1.0e6;
+    boundary.vx_mps = sign * 1.0e3;
+    boundary.vy_mps = -sign * 1.0e3;
+    boundary.spin_rad_s = sign * 1.0e4;
+    boundary.estimated_phase_rad = -sign * 1.0e6;
+    simulator.reset(boundary);
+    simulator.advance_ticks(1);
+    const auto state = simulator.snapshot();
+    require(std::isfinite(state.x_m) && std::isfinite(state.y_m) &&
+                std::isfinite(state.heading_rad) &&
+                std::isfinite(state.vx_mps) &&
+                std::isfinite(state.vy_mps) &&
+                std::isfinite(state.spin_rad_s) &&
+                std::isfinite(state.sensed_acceleration.x_mps2) &&
+                std::isfinite(state.sensed_acceleration.y_mps2),
+            "every accepted reset boundary must remain finite after a tick");
+  }
+
+  melty::sim::SimulationConfig tiny_mass{};
+  tiny_mass.physical.mass_kg = std::numeric_limits<double>::min();
+  require(!melty::sim::Simulator::validate(tiny_mass).empty(),
+          "tiny positive mass must be rejected before integration");
+  melty::sim::SimulationConfig queue_bomb{};
+  queue_bomb.physics_tick_us = 1;
+  queue_bomb.sensor.sample_period_us = 1;
+  queue_bomb.firmware.control_period_us = 1;
+  queue_bomb.sensor.latency_us = 10'000'000;
+  queue_bomb.command_latency_us = 10'000'000;
+  queue_bomb.actuator_latency_us = 10'000'000;
+  require(!melty::sim::Simulator::validate(queue_bomb).empty(),
+          "latency/period combinations with excessive queues must be rejected");
+  melty::sim::SimulationConfig reasonable_queues{};
+  reasonable_queues.sensor.latency_us = 5'000;
+  reasonable_queues.command_latency_us = 5'000;
+  reasonable_queues.actuator_latency_us = 5'000;
+  require(melty::sim::Simulator::validate(reasonable_queues).empty(),
+          "ordinary millisecond transport latency should remain supported");
+  melty::sim::Simulator bounded(reasonable_queues);
+  bounded.advance_ticks(1);
+  require(std::isfinite(bounded.snapshot().x_m),
+          "accepted bounded configuration must advance promptly and finitely");
+
   melty::sim::SimulationConfig saturated_config{};
   saturated_config.sensor.noise_stddev_mps2 = 0.0;
   saturated_config.sensor.max_acceleration_mps2 = 15.0;

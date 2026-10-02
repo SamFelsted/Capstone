@@ -20,6 +20,11 @@ class Plant {
   Plant(const Plant&) = delete;
   Plant& operator=(const Plant&) = delete;
 
+  // Returns false when the derived tire/chassis integration step is not finite
+  // or would exceed the simulator's bounded substep budget.
+  static bool substep_count(const PhysicalConfig& config, double dt_s,
+                            std::size_t& count) noexcept;
+
   void reset(const ResetState& state);
   void step(double wheel_a_command, double wheel_b_command, double dt_s);
 

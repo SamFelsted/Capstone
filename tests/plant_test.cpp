@@ -1,6 +1,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
+#include <stdexcept>
 
 #include "sim/plant.hpp"
 
@@ -77,6 +79,29 @@ int main() {
   const auto coarse_state = coarse.snapshot(500'000);
   require(std::abs(fine_state.spin_rad_s - coarse_state.spin_rad_s) < 1.0,
           "spin solution should converge across practical outer timesteps");
+
+  const auto before_rejected_reset = coarse.snapshot(0);
+  melty::sim::ResetState unsafe{};
+  unsafe.spin_rad_s = std::numeric_limits<double>::max();
+  bool direct_reset_rejected = false;
+  try {
+    coarse.reset(unsafe);
+  } catch (const std::invalid_argument&) {
+    direct_reset_rejected = true;
+  }
+  const auto after_rejected_reset = coarse.snapshot(0);
+  require(direct_reset_rejected &&
+              before_rejected_reset.spin_rad_s ==
+                  after_rejected_reset.spin_rad_s &&
+              before_rejected_reset.x_m == after_rejected_reset.x_m,
+          "Plant reset must reject unsafe magnitudes without mutating state");
+
+  std::size_t substeps = 0;
+  melty::sim::PhysicalConfig unstable = config;
+  unstable.moment_of_inertia_kg_m2 = 1.0e-9;
+  unstable.tire_longitudinal_stiffness_n_per_mps = 1.0e9;
+  require(!melty::sim::Plant::substep_count(unstable, 0.00025, substeps),
+          "yaw-stiff extreme must exceed the bounded substep budget");
 
   std::cout << "plant_test passed\n";
   return 0;

@@ -82,3 +82,20 @@ configured control boundary and its output enters the actuator-delay queue.
 Sensor and control periods must be integer multiples of the physics tick.
 Oversized advances and timestamp overflow are rejected instead of iterating or
 wrapping indefinitely.
+
+The numerical domain is intentionally finite. Reset positions are limited to
+`±1e6 m`, linear speeds to `±1e3 m/s`, spin to `±1e4 rad/s`, and physical and
+estimated angles to `±1e6 rad`. Sensor radius is limited to 10 m, range and bias
+to `1e9 m/s²`, and noise deviation to `1e8 m/s²`. Physical parameters likewise
+use broad finite engineering bounds; values outside them are unsupported rather
+than silently clamped.
+
+For every accepted configuration, the same shared calculation used by the
+integrator must resolve rotor/tire, two-contact translation, yaw contact, ESC,
+electromechanical, and viscous-drag time scales in at most 100 substeps per
+physics tick. Non-finite derived values fail immediately. The combined sensor,
+receiver, and actuator transport queues are limited to 100,000 worst-case
+in-flight events, computed from latency and acquisition period during
+validation. These limits prevent tiny positive parameters or long-latency,
+high-rate configurations from turning one nominal tick into an unbounded CPU or
+memory request.

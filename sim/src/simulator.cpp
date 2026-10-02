@@ -111,10 +111,16 @@ class Simulator::Impl {
         center.body_y_mps2 + center.angular_rad_s2 * config.sensor.radius_m;
     double sensor_x = c * point_x_body + s * point_y_body;
     double sensor_y = -s * point_x_body + c * point_y_body;
+    if (!finite(sensor_x) || !finite(sensor_y)) {
+      throw std::overflow_error("sensor kinematics became non-finite");
+    }
     sensor_x += config.sensor.bias_x_mps2 +
                 config.sensor.noise_stddev_mps2 * noise.normal();
     sensor_y += config.sensor.bias_y_mps2 +
                 config.sensor.noise_stddev_mps2 * noise.normal();
+    if (!finite(sensor_x) || !finite(sensor_y)) {
+      throw std::overflow_error("sensor model became non-finite");
+    }
     const bool saturated =
         std::abs(sensor_x) > config.sensor.max_acceleration_mps2 ||
         std::abs(sensor_y) > config.sensor.max_acceleration_mps2;
@@ -262,11 +268,13 @@ std::vector<std::string> Simulator::validate(const SimulationConfig& config) {
   if (!positive(p.battery_voltage)) errors.emplace_back("physical.battery_voltage must be positive and finite");
 
   const SensorModelConfig& sensor = config.sensor;
-  if (!nonnegative(sensor.radius_m)) errors.emplace_back("sensor.radius_m must be nonnegative and finite");
-  if (!finite(sensor.angle_rad)) errors.emplace_back("sensor.angle_rad must be finite");
-  if (!positive(sensor.max_acceleration_mps2)) errors.emplace_back("sensor.max_acceleration_mps2 must be positive and finite");
-  if (!nonnegative(sensor.noise_stddev_mps2)) errors.emplace_back("sensor.noise_stddev_mps2 must be nonnegative and finite");
-  if (!finite(sensor.bias_x_mps2) || !finite(sensor.bias_y_mps2)) errors.emplace_back("sensor biases must be finite");
+  if (!nonnegative(sensor.radius_m) || sensor.radius_m > 10.0) errors.emplace_back("sensor.radius_m must be in [0, 10]");
+  if (!finite(sensor.angle_rad) || std::abs(sensor.angle_rad) > 1.0e6) errors.emplace_back("sensor.angle_rad exceeds supported numerical bounds");
+  if (!positive(sensor.max_acceleration_mps2) || sensor.max_acceleration_mps2 > 1.0e9) errors.emplace_back("sensor.max_acceleration_mps2 must be in (0, 1e9]");
+  if (!nonnegative(sensor.noise_stddev_mps2) || sensor.noise_stddev_mps2 > 1.0e8) errors.emplace_back("sensor.noise_stddev_mps2 must be in [0, 1e8]");
+  if (!finite(sensor.bias_x_mps2) || !finite(sensor.bias_y_mps2) ||
+      std::abs(sensor.bias_x_mps2) > 1.0e9 ||
+      std::abs(sensor.bias_y_mps2) > 1.0e9) errors.emplace_back("sensor biases exceed supported numerical bounds");
   if (sensor.sample_period_us == 0) errors.emplace_back("sensor.sample_period_us must be nonzero");
   if (config.physics_tick_us == 0 || config.physics_tick_us > 5'000) errors.emplace_back("physics_tick_us must be in [1, 5000]");
   constexpr Micros kMaximumTransportLatencyUs = 10'000'000;
@@ -274,6 +282,30 @@ std::vector<std::string> Simulator::validate(const SimulationConfig& config) {
       config.command_latency_us > kMaximumTransportLatencyUs ||
       config.actuator_latency_us > kMaximumTransportLatencyUs) {
     errors.emplace_back("transport latencies must not exceed 10 seconds");
+  }
+  constexpr std::uint64_t kMaximumQueuedEvents = 100'000;
+  const auto queued_events = [](Micros latency, Micros period) {
+    if (period == 0) return std::numeric_limits<std::uint64_t>::max();
+    return latency / period + (latency % period != 0 ? 1u : 0u) + 1u;
+  };
+  const std::uint64_t sensor_events =
+      queued_events(sensor.latency_us, sensor.sample_period_us);
+  const std::uint64_t command_events =
+      queued_events(config.command_latency_us,
+                    config.firmware.control_period_us);
+  const std::uint64_t actuator_events =
+      queued_events(config.actuator_latency_us,
+                    config.firmware.control_period_us);
+  std::uint64_t total_events = 0;
+  const auto exceeds_event_budget = [&](std::uint64_t count) {
+    if (count > kMaximumQueuedEvents - total_events) return true;
+    total_events += count;
+    return false;
+  };
+  if (exceeds_event_budget(sensor_events) ||
+      exceeds_event_budget(command_events) ||
+      exceeds_event_budget(actuator_events)) {
+    errors.emplace_back("configured transport queues exceed 100000 in-flight events");
   }
   if (config.physics_tick_us != 0 &&
       sensor.sample_period_us % config.physics_tick_us != 0) {
@@ -287,19 +319,34 @@ std::vector<std::string> Simulator::validate(const SimulationConfig& config) {
   if (!Runtime::valid_config(config.firmware)) {
     errors.emplace_back("firmware runtime configuration is invalid");
   }
-  if (positive(p.motor_inertia_kg_m2) && positive(p.gear_ratio) &&
-      positive(p.tire_longitudinal_stiffness_n_per_mps) &&
-      positive(p.wheel_radius_m) && config.physics_tick_us != 0) {
-    const double reflected_inertia =
-        p.motor_inertia_kg_m2 * p.gear_ratio * p.gear_ratio;
-    const double stable_step_s =
-        0.1 * reflected_inertia /
-        (p.tire_longitudinal_stiffness_n_per_mps * p.wheel_radius_m *
-         p.wheel_radius_m);
-    if (static_cast<double>(config.physics_tick_us) * 1.0e-6 >
-        100.0 * stable_step_s) {
-      errors.emplace_back("tire/rotor stiffness would require more than 100 integration substeps");
-    }
+  const ControllerConfig& controller = config.firmware.controller;
+  const bool supported_firmware =
+      controller.sensor_radius_m >= 1.0e-5 &&
+      controller.sensor_radius_m <= 10.0 &&
+      std::abs(controller.sensor_angle_rad) <= 1.0e6 &&
+      controller.minimum_phase_spin_rad_s <= 1.0e5 &&
+      controller.radial_accel_floor_mps2 <= 1.0e9 &&
+      controller.radial_accel_filter_hz >= 1.0e-3 &&
+      controller.radial_accel_filter_hz <= 1.0e5 &&
+      controller.maximum_spin_rad_s <= 1.0e5 &&
+      controller.spin_kp <= 1.0e4 && controller.spin_ki <= 1.0e4 &&
+      controller.spin_integrator_limit <= 1.0 &&
+      controller.translation_gain <= 10.0 &&
+      std::abs(controller.translation_phase_offset_rad) <= 1.0e6 &&
+      config.firmware.control_period_us <= 1'000'000'000ULL &&
+      config.firmware.acceleration_timeout_us <= 1'000'000'000ULL &&
+      config.firmware.rc_timeout_us <= 1'000'000'000ULL &&
+      config.firmware.maximum_tick_interval_us <= 1'000'000'000ULL &&
+      config.firmware.arm_confirm_ticks <= 1'000'000;
+  if (!supported_firmware) {
+    errors.emplace_back("firmware values exceed supported simulation bounds");
+  }
+  std::size_t substeps = 0;
+  if (config.physics_tick_us != 0 &&
+      !Plant::substep_count(p,
+                            static_cast<double>(config.physics_tick_us) * 1.0e-6,
+                            substeps)) {
+    errors.emplace_back("physical values exceed supported bounds or require more than 100 integration substeps");
   }
   return errors;
 }
@@ -310,8 +357,12 @@ void Simulator::reset(const ResetState& state) {
   if (!finite(state.x_m) || !finite(state.y_m) ||
       !finite(state.heading_rad) || !finite(state.vx_mps) ||
       !finite(state.vy_mps) || !finite(state.spin_rad_s) ||
-      !finite(state.estimated_phase_rad)) {
-    throw std::invalid_argument("reset state values must be finite");
+      !finite(state.estimated_phase_rad) || std::abs(state.x_m) > 1.0e6 ||
+      std::abs(state.y_m) > 1.0e6 || std::abs(state.heading_rad) > 1.0e6 ||
+      std::abs(state.vx_mps) > 1.0e3 || std::abs(state.vy_mps) > 1.0e3 ||
+      std::abs(state.spin_rad_s) > 1.0e4 ||
+      std::abs(state.estimated_phase_rad) > 1.0e6) {
+    throw std::invalid_argument("reset state exceeds supported numerical bounds");
   }
   impl_->reset(state);
 }

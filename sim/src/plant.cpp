@@ -2,13 +2,52 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 
 namespace melty::sim {
 namespace {
 
 constexpr double kGravityMps2 = 9.80665;
 constexpr double kPi = 3.14159265358979323846;
+constexpr std::size_t kMaximumSubsteps = 100;
+
+bool finite_in_range(double value, double minimum, double maximum) {
+  return std::isfinite(value) && value >= minimum && value <= maximum;
+}
+
+bool supported_reset_state(const ResetState& state) {
+  return finite_in_range(state.x_m, -1.0e6, 1.0e6) &&
+         finite_in_range(state.y_m, -1.0e6, 1.0e6) &&
+         finite_in_range(state.heading_rad, -1.0e6, 1.0e6) &&
+         finite_in_range(state.vx_mps, -1.0e3, 1.0e3) &&
+         finite_in_range(state.vy_mps, -1.0e3, 1.0e3) &&
+         finite_in_range(state.spin_rad_s, -1.0e4, 1.0e4) &&
+         finite_in_range(state.estimated_phase_rad, -1.0e6, 1.0e6);
+}
+
+bool supported_physical_config(const PhysicalConfig& p) {
+  return finite_in_range(p.mass_kg, 1.0e-3, 1.0e4) &&
+         finite_in_range(p.body_radius_m, 1.0e-4, 10.0) &&
+         finite_in_range(p.moment_of_inertia_kg_m2, 1.0e-9, 1.0e5) &&
+         finite_in_range(p.wheel_radius_m, 1.0e-5, 1.0) &&
+         finite_in_range(p.wheel_offset_m, 1.0e-5, p.body_radius_m) &&
+         finite_in_range(p.motor_torque_constant_nm_per_a, 1.0e-8, 100.0) &&
+         finite_in_range(p.motor_back_emf_v_per_rad_s, 1.0e-8, 100.0) &&
+         finite_in_range(p.motor_resistance_ohm, 1.0e-6, 1.0e4) &&
+         finite_in_range(p.gear_ratio, 1.0e-3, 1.0e4) &&
+         finite_in_range(p.drivetrain_efficiency, 1.0e-6, 1.0) &&
+         finite_in_range(p.motor_inertia_kg_m2, 1.0e-12, 10.0) &&
+         finite_in_range(p.motor_current_limit_a, 1.0e-6, 1.0e6) &&
+         finite_in_range(p.motor_time_constant_s, 1.0e-7, 100.0) &&
+         finite_in_range(p.tire_friction_coefficient, 0.0, 10.0) &&
+         finite_in_range(p.tire_longitudinal_stiffness_n_per_mps, 1.0e-3,
+                         1.0e9) &&
+         finite_in_range(p.linear_drag_n_per_mps, 0.0, 1.0e6) &&
+         finite_in_range(p.angular_drag_nm_per_rad_s, 0.0, 1.0e6) &&
+         finite_in_range(p.battery_voltage, 1.0e-6, 1.0e6);
+}
 
 double wrap_angle(double angle) {
   return std::remainder(angle, 2.0 * kPi);
@@ -148,12 +187,21 @@ class Plant::Impl {
 };
 
 Plant::Plant(const PhysicalConfig& config)
-    : impl_(std::make_unique<Impl>(config)) {}
+    : impl_(std::make_unique<Impl>(config)) {
+  std::size_t count = 0;
+  if (!supported_physical_config(config) ||
+      !substep_count(config, 0.00025, count)) {
+    throw std::invalid_argument("unsupported physical configuration");
+  }
+}
 Plant::~Plant() = default;
 Plant::Plant(Plant&&) noexcept = default;
 Plant& Plant::operator=(Plant&&) noexcept = default;
 
 void Plant::reset(const ResetState& state) {
+  if (!supported_reset_state(state)) {
+    throw std::invalid_argument("reset state exceeds supported numerical bounds");
+  }
   impl_->x = state.x_m;
   impl_->y = state.y_m;
   impl_->heading = wrap_angle(state.heading_rad);
@@ -178,25 +226,92 @@ void Plant::reset(const ResetState& state) {
 void Plant::step(double wheel_a_command, double wheel_b_command, double dt_s) {
   // Keep the stiff tire/rotor coupling well inside its explicit stability
   // region even when a caller selects a relatively coarse control tick.
+  if (!std::isfinite(wheel_a_command) || !std::isfinite(wheel_b_command)) {
+    throw std::invalid_argument("motor commands must be finite");
+  }
+  std::size_t substeps = 0;
+  if (!substep_count(impl_->config, dt_s, substeps)) {
+    throw std::invalid_argument("physical timestep exceeds bounded substep budget");
+  }
+  const double substep_s = dt_s / static_cast<double>(substeps);
+  for (std::size_t i = 0; i < substeps; ++i) {
+    impl_->substep(wheel_a_command, wheel_b_command, substep_s);
+    const Snapshot state = snapshot(0);
+    const PlantAcceleration accel = acceleration();
+    const bool finite_state =
+        std::isfinite(state.x_m) && std::isfinite(state.y_m) &&
+        std::isfinite(state.heading_rad) && std::isfinite(state.vx_mps) &&
+        std::isfinite(state.vy_mps) && std::isfinite(state.spin_rad_s) &&
+        std::isfinite(state.wheel_a.motor_current_a) &&
+        std::isfinite(state.wheel_b.motor_current_a) &&
+        std::isfinite(state.wheel_a.wheel_speed_rad_s) &&
+        std::isfinite(state.wheel_b.wheel_speed_rad_s) &&
+        std::isfinite(state.wheel_a.slip_mps) &&
+        std::isfinite(state.wheel_b.slip_mps) &&
+        std::isfinite(state.wheel_a.requested_force_n) &&
+        std::isfinite(state.wheel_b.requested_force_n) &&
+        std::isfinite(state.wheel_a.applied_force_n) &&
+        std::isfinite(state.wheel_b.applied_force_n) &&
+        std::isfinite(accel.body_x_mps2) &&
+        std::isfinite(accel.body_y_mps2) &&
+        std::isfinite(accel.angular_rad_s2);
+    if (!finite_state) {
+      throw std::overflow_error("physical state became non-finite");
+    }
+  }
+}
+
+bool Plant::substep_count(const PhysicalConfig& config, double dt_s,
+                          std::size_t& count) noexcept {
+  count = 0;
+  if (!supported_physical_config(config) || !std::isfinite(dt_s) ||
+      dt_s <= 0.0) {
+    return false;
+  }
   const double reflected_inertia =
-      impl_->config.motor_inertia_kg_m2 * impl_->config.gear_ratio *
-      impl_->config.gear_ratio;
-  const double wheel_coupling_time =
-      reflected_inertia /
-      (impl_->config.tire_longitudinal_stiffness_n_per_mps *
-       impl_->config.wheel_radius_m * impl_->config.wheel_radius_m);
+      config.motor_inertia_kg_m2 * config.gear_ratio * config.gear_ratio;
+  const double denominator =
+      config.tire_longitudinal_stiffness_n_per_mps *
+      config.wheel_radius_m * config.wheel_radius_m;
+  const double wheel_coupling_time = reflected_inertia / denominator;
   const double chassis_coupling_time =
-      impl_->config.mass_kg /
-      impl_->config.tire_longitudinal_stiffness_n_per_mps;
+      config.mass_kg /
+      (2.0 * config.tire_longitudinal_stiffness_n_per_mps);
+  const double angular_denominator =
+      2.0 * config.tire_longitudinal_stiffness_n_per_mps *
+      config.wheel_offset_m * config.wheel_offset_m;
+  const double angular_coupling_time =
+      config.moment_of_inertia_kg_m2 / angular_denominator;
+  const double electrical_mechanical_time =
+      config.motor_inertia_kg_m2 * config.motor_resistance_ohm /
+      (config.motor_torque_constant_nm_per_a *
+       config.motor_back_emf_v_per_rad_s * config.drivetrain_efficiency);
+  const double linear_drag_time =
+      config.linear_drag_n_per_mps > 0.0
+          ? config.mass_kg / config.linear_drag_n_per_mps
+          : std::numeric_limits<double>::infinity();
+  const double angular_drag_time =
+      config.angular_drag_nm_per_rad_s > 0.0
+          ? config.moment_of_inertia_kg_m2 /
+                config.angular_drag_nm_per_rad_s
+          : std::numeric_limits<double>::infinity();
   const double maximum_substep_s =
       std::min({0.00025, 0.1 * wheel_coupling_time,
-                0.1 * chassis_coupling_time});
-  const int substeps =
-      std::max(1, static_cast<int>(std::ceil(dt_s / maximum_substep_s)));
-  const double substep_s = dt_s / static_cast<double>(substeps);
-  for (int i = 0; i < substeps; ++i) {
-    impl_->substep(wheel_a_command, wheel_b_command, substep_s);
+                0.1 * chassis_coupling_time,
+                0.1 * angular_coupling_time,
+                0.1 * config.motor_time_constant_s,
+                0.1 * electrical_mechanical_time,
+                0.1 * linear_drag_time, 0.1 * angular_drag_time});
+  if (!std::isfinite(maximum_substep_s) || maximum_substep_s <= 0.0) {
+    return false;
   }
+  const double required = std::ceil(dt_s / maximum_substep_s);
+  if (!std::isfinite(required) || required < 1.0 ||
+      required > static_cast<double>(kMaximumSubsteps)) {
+    return false;
+  }
+  count = static_cast<std::size_t>(required);
+  return true;
 }
 
 Snapshot Plant::snapshot(Micros now_us) const {
