@@ -23,6 +23,7 @@ PYBIND11_MODULE(melty_sim, m) {
       .value("CONTROL_DEADLINE", Fault::control_deadline)
       .value("PHASE_INVALID", Fault::phase_invalid)
       .value("ACCELERATION_SATURATED", Fault::acceleration_saturated)
+      .value("CONTROLLER_NUMERIC", Fault::controller_numeric)
       .value("HAL_ERROR", Fault::hal_error);
 
   py::class_<AccelerationSample>(m, "AccelerationSample")
@@ -170,7 +171,7 @@ PYBIND11_MODULE(melty_sim, m) {
       .def(py::init<const SimulationConfig&>(), py::arg("config") = SimulationConfig{})
       .def_static("validate", &Simulator::validate)
       .def_property_readonly("config", &Simulator::config,
-                             py::return_value_policy::reference_internal)
+                             py::return_value_policy::copy)
       .def("reset", [](Simulator& self, const ResetState& state) { self.reset(state); },
            py::arg("state") = ResetState{})
       .def("set_command", &Simulator::set_command)

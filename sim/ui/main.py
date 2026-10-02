@@ -4,7 +4,9 @@ import argparse
 import csv
 import json
 import math
+import shutil
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -30,6 +32,7 @@ FAULTS = (
     ("INVALID CONFIGURATION", native.Fault.INVALID_CONFIGURATION),
     ("INVALID ACCELERATION", native.Fault.INVALID_ACCELERATION),
     ("ACCELERATION SATURATED", native.Fault.ACCELERATION_SATURATED),
+    ("CONTROLLER NUMERIC", native.Fault.CONTROLLER_NUMERIC),
     ("STALE ACCELERATION", native.Fault.STALE_ACCELERATION),
     ("INVALID RC", native.Fault.INVALID_RC),
     ("STALE RC", native.Fault.STALE_RC),
@@ -82,6 +85,7 @@ class MainWindow(QMainWindow):
     apply_requested = Signal(object, object)
     shutdown_requested = Signal()
     recording_boundary_requested = Signal()
+    phase_reset_requested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -94,12 +98,13 @@ class MainWindow(QMainWindow):
         self.snapshot = None
         self.editors = {}
         self._epoch_events = []
-        self._epoch_snapshots = []
+        self._epoch_spool = self._epoch_spool_writer = None
         self._recording_document = None
         self._recording_started_time_us = None
         self.record_file = self.record_writer = self.record_path = None
         self.worker_timer_destroyed = False
         self._build_ui()
+        self._replace_epoch_spool()
         self.arena.set_config(self.config)
         self._populate_editors(config_codec.to_document(self.config, self.initial_state))
         self._start_worker()
@@ -117,6 +122,7 @@ class MainWindow(QMainWindow):
         self.apply_requested.connect(self.worker.apply_config)
         self.shutdown_requested.connect(self.worker.shutdown)
         self.recording_boundary_requested.connect(self.worker.capture_recording_boundary)
+        self.phase_reset_requested.connect(self.worker.request_phase_reset)
         self.worker.snapshot_ready.connect(self._snapshot)
         self.worker.running_changed.connect(self._running_changed)
         self.worker.config_applied.connect(self._config_applied)
@@ -128,6 +134,7 @@ class MainWindow(QMainWindow):
         self.worker.timer_destroyed.connect(self._worker_timer_destroyed)
         self.worker.stopped.connect(self.worker.deleteLater)
         self.worker.stopped.connect(self.thread.quit, Qt.ConnectionType.DirectConnection)
+        self.thread.finished.connect(self._close_epoch_spool)
         self.thread.start()
 
     def _worker_timer_destroyed(self):
@@ -252,7 +259,10 @@ class MainWindow(QMainWindow):
 
     def _config_applied(self, config, state):
         self.config, self.initial_state = config, state
-        self._epoch_events.clear(); self._epoch_snapshots.clear()
+        self._epoch_events.clear(); self._replace_epoch_spool()
+        command = self._copy_command(reset_phase=False)
+        command.arm = False
+        self.command = command
         self.arm_button.blockSignals(True); self.arm_button.setChecked(False)
         self.arm_button.setText("DISARMED"); self.arm_button.blockSignals(False)
         self.arena.set_config(config); self.telemetry.clear()
@@ -286,12 +296,7 @@ class MainWindow(QMainWindow):
         self.command_requested.emit(command)
 
     def _zero_phase(self):
-        command = self._copy_command(reset_phase=True)
-        self.command = command; self.command_requested.emit(command)
-        QTimer.singleShot(50, self._clear_phase_reset)
-    def _clear_phase_reset(self):
-        command = self._copy_command(reset_phase=False)
-        self.command = command; self.command_requested.emit(command)
+        self.phase_reset_requested.emit()
 
     def _copy_command(self, reset_phase=False):
         command = native.UserCommand()
@@ -301,7 +306,7 @@ class MainWindow(QMainWindow):
         return command
 
     def _snapshot(self, s):
-        self.snapshot = s; self._epoch_snapshots.append(s)
+        self.snapshot = s; self._write_epoch_snapshot(s)
         self.arena.set_snapshot(s); self.telemetry.add_snapshot(s)
         self.time_label.setText(f"  t = {s.time_us / 1e6:.3f} s  ")
         self.actual_spin.setText(f"{s.spin_rad_s:+.2f} rad/s")
@@ -329,7 +334,7 @@ class MainWindow(QMainWindow):
             self._finish_recording(final_snapshot)
 
     def _epoch_reset(self):
-        self._epoch_events.clear(); self._epoch_snapshots.clear()
+        self._epoch_events.clear(); self._replace_epoch_spool()
         self.telemetry.clear(); self.arena.trail.clear()
 
     def _toggle_recording(self, checked):
@@ -351,15 +356,12 @@ class MainWindow(QMainWindow):
         try:
             self.record_path = Path(path)
             self.record_file = self.record_path.open("w", newline="", encoding="utf-8")
+            self._epoch_spool.flush(); self._epoch_spool.seek(0)
+            shutil.copyfileobj(self._epoch_spool, self.record_file)
+            self._epoch_spool.seek(0, 2)
             self.record_writer = csv.writer(self.record_file)
-            self.record_writer.writerow(["time_us", "x_m", "y_m", "heading_rad", "vx_mps", "vy_mps",
-                                         "spin_rad_s", "estimated_phase_rad", "estimated_spin_rad_s",
-                                         "wheel_a_command", "wheel_b_command", "fault_mask", "armed",
-                                         "wheel_a_force_n", "wheel_b_force_n"])
             self._recording_document = config_codec.to_document(self.config, self.initial_state)
             self._recording_started_time_us = self.snapshot.time_us if self.snapshot else 0
-            for snapshot in self._epoch_snapshots:
-                self._write_record_snapshot(snapshot)
             self.record_button.setText("STOP RECORDING")
         except OSError as exc:
             self._abort_recording_file()
@@ -369,11 +371,7 @@ class MainWindow(QMainWindow):
         if not self.record_writer:
             return
         try:
-            self.record_writer.writerow([s.time_us, s.x_m, s.y_m, s.heading_rad, s.vx_mps, s.vy_mps,
-                                         s.spin_rad_s, s.firmware.controller.phase_rad,
-                                         s.firmware.controller.spin_rad_s, s.firmware.output.wheel_a,
-                                         s.firmware.output.wheel_b, int(s.firmware.faults), int(s.firmware.armed),
-                                         s.wheel_a.applied_force_n, s.wheel_b.applied_force_n])
+            self.record_writer.writerow(self._snapshot_row(s))
         except (OSError, ValueError) as exc:
             self._abort_recording_file()
             self._show_error(f"recording write failed: {exc}")
@@ -416,6 +414,38 @@ class MainWindow(QMainWindow):
         return {name: getattr(snapshot, name) for name in
                 ("x_m", "y_m", "heading_rad", "vx_mps", "vy_mps", "spin_rad_s")}
 
+    @staticmethod
+    def _snapshot_row(s):
+        return [s.time_us, s.x_m, s.y_m, s.heading_rad, s.vx_mps, s.vy_mps,
+                s.spin_rad_s, s.firmware.controller.phase_rad,
+                s.firmware.controller.spin_rad_s, s.firmware.output.wheel_a,
+                s.firmware.output.wheel_b, int(s.firmware.faults), int(s.firmware.armed),
+                s.wheel_a.applied_force_n, s.wheel_b.applied_force_n]
+
+    def _replace_epoch_spool(self):
+        if self._epoch_spool is not None:
+            self._epoch_spool.close()
+        self._epoch_spool = tempfile.TemporaryFile(mode="w+", newline="", encoding="utf-8")
+        self._epoch_spool_writer = csv.writer(self._epoch_spool)
+        self._epoch_spool_writer.writerow([
+            "time_us", "x_m", "y_m", "heading_rad", "vx_mps", "vy_mps",
+            "spin_rad_s", "estimated_phase_rad", "estimated_spin_rad_s",
+            "wheel_a_command", "wheel_b_command", "fault_mask", "armed",
+            "wheel_a_force_n", "wheel_b_force_n",
+        ])
+
+    def _close_epoch_spool(self):
+        if self._epoch_spool is not None:
+            self._epoch_spool.close()
+            self._epoch_spool = self._epoch_spool_writer = None
+
+    def _write_epoch_snapshot(self, snapshot):
+        try:
+            self._epoch_spool_writer.writerow(self._snapshot_row(snapshot))
+        except (OSError, ValueError) as exc:
+            self._replace_epoch_spool()
+            self._show_error(f"epoch history spool failed: {exc}")
+
     def _load_preset(self):
         path, _ = QFileDialog.getOpenFileName(self, "Load preset", "", "JSON (*.json)")
         if not path: return
@@ -445,6 +475,7 @@ class MainWindow(QMainWindow):
             return
         QApplication.processEvents()
         self._finish_recording()
+        self._close_epoch_spool()
         event.accept()
 
 

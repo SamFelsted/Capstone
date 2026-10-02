@@ -71,6 +71,36 @@ class SimulationWorker(QObject):
         except Exception as exc:
             self._fail(exc)
 
+    @Slot()
+    def request_phase_reset(self):
+        """Deliver a phase-reset pulse through the normal simulated RC path."""
+        if self._simulator is None:
+            return
+        try:
+            status = self._simulator.snapshot().firmware
+            if status.armed or self._command.arm:
+                raise ValueError("phase reset requires the robot to be disarmed")
+            asserted = self._copy_command(self._command)
+            asserted.reset_phase = True
+            self._command = asserted
+            self._simulator.set_command(asserted)
+            self._acknowledge_command(asserted)
+            # The pulse remains asserted for receiver delivery plus a complete
+            # firmware control period. Advancing here also makes the action work
+            # while paused and with deliberately slow control periods.
+            hold_us = (int(self._config.command_latency_us) +
+                       int(self._config.firmware.control_period_us) +
+                       int(self._config.physics_tick_us))
+            self._simulator.advance_for(hold_us)
+            cleared = self._copy_command(asserted)
+            cleared.reset_phase = False
+            self._command = cleared
+            self._simulator.set_command(cleared)
+            self._acknowledge_command(cleared)
+            self._emit_snapshot()
+        except Exception as exc:
+            self._fail(exc)
+
     @Slot(bool)
     def set_running(self, running):
         self._running = bool(running)

@@ -50,6 +50,14 @@ INTEGER_FIELDS = {
     "control_period_us", "arm_confirm_ticks", "physics_tick_us",
     "command_latency_us", "actuator_latency_us", "scenario_seed",
 }
+UINT64_MAX = (1 << 64) - 1
+UINT32_MAX = (1 << 32) - 1
+INTEGER_LIMITS = {
+    "spin_direction": (-(1 << 31), (1 << 31) - 1),
+    "arm_confirm_ticks": (0, UINT32_MAX),
+    **{name: (0, UINT64_MAX) for name in INTEGER_FIELDS
+       if name not in {"spin_direction", "arm_confirm_ticks"}},
+}
 
 
 def _values(obj: Any, names: tuple[str, ...]) -> dict[str, Any]:
@@ -93,13 +101,21 @@ def _assign(target: Any, source: dict[str, Any], names: tuple[str, ...], path: s
         raw = source[name]
         if isinstance(raw, bool) or not isinstance(raw, (int, float)):
             raise ValueError(f"{path}.{name} must be numeric")
-        if not math.isfinite(float(raw)):
-            raise ValueError(f"{path}.{name} must be finite")
         if name in INTEGER_FIELDS:
+            if isinstance(raw, float) and not math.isfinite(raw):
+                raise ValueError(f"{path}.{name} must be finite")
             if int(raw) != raw:
                 raise ValueError(f"{path}.{name} must be an integer")
             raw = int(raw)
-        setattr(target, name, raw)
+            low, high = INTEGER_LIMITS[name]
+            if not low <= raw <= high:
+                raise ValueError(f"{path}.{name} must be in [{low}, {high}]")
+        elif not math.isfinite(float(raw)):
+            raise ValueError(f"{path}.{name} must be finite")
+        try:
+            setattr(target, name, raw)
+        except (TypeError, OverflowError, ValueError) as exc:
+            raise ValueError(f"{path}.{name}: {exc}") from exc
 
 
 def from_document(module: Any, document: dict[str, Any]) -> tuple[Any, Any]:
@@ -134,6 +150,11 @@ def from_document(module: Any, document: dict[str, Any]) -> tuple[Any, Any]:
     errors = list(module.Simulator.validate(config))
     if errors:
         raise ValueError("; ".join(errors))
+    try:
+        candidate = module.Simulator(config)
+        candidate.reset(state)
+    except (TypeError, OverflowError, ValueError, RuntimeError) as exc:
+        raise ValueError(f"initial_state: {exc}") from exc
     return config, state
 
 

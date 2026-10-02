@@ -68,8 +68,14 @@ class ArenaWidget(QWidget):
         p.drawLine(QPointF(wheel_offset, -wheel_r), QPointF(wheel_offset, wheel_r))
         sensor_r = cfg.sensor.radius_m * scale
         angle = cfg.sensor.angle_rad
-        sensor = QPointF(sensor_r * math.cos(angle), -sensor_r * math.sin(angle))
+        # Sensor position is fixed on body +X. angle_rad rotates only its axes.
+        sensor = QPointF(sensor_r, 0)
         p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor("#ef5da8")); p.drawEllipse(sensor, 4, 4)
+        axis = 11.0
+        p.setPen(QPen(QColor("#ef5da8"), 1))
+        p.drawLine(sensor, sensor + QPointF(axis * math.cos(angle), -axis * math.sin(angle)))
+        p.setPen(QPen(QColor("#8f5def"), 1))
+        p.drawLine(sensor, sensor + QPointF(axis * math.sin(angle), axis * math.cos(angle)))
         p.restore()
         p.setPen(QColor("#b9c7d8"))
         p.drawText(16, 25, f"x {s.x_m:+.3f} m   y {s.y_m:+.3f} m   heading {s.heading_rad:+.3f} rad")

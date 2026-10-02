@@ -20,6 +20,7 @@ add_library(melty_physics
 )
 target_include_directories(melty_physics PUBLIC sim/include PRIVATE sim/src)
 target_link_libraries(melty_physics PUBLIC melty_firmware)
+set_target_properties(melty_firmware melty_physics PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_executable(sim_cli sim/src/main.cpp)
 target_link_libraries(sim_cli PRIVATE melty_physics)
