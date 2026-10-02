@@ -3,11 +3,15 @@
 #include <array>
 #include <cmath>
 
+#include "melty/rc_pwm_input.hpp"
+
 namespace melty {
 
 bool valid_board_profile(const BoardProfile& p) {
-  if (!(p.rc_min_us >= 750 && p.rc_min_us < p.rc_center_us &&
-        p.rc_center_us < p.rc_max_us && p.rc_max_us <= 2250 &&
+  if (!(p.rc_min_us >= kPwmRcElectricalMinUs &&
+        p.rc_min_us < p.rc_center_us &&
+        p.rc_center_us < p.rc_max_us &&
+        p.rc_max_us <= kPwmRcElectricalMaxUs &&
         p.esc_safe_us >= 750 && p.esc_safe_us < p.esc_max_us &&
         p.esc_max_us <= 2250 &&
         p.h3lis331dl_address >= 0x08 && p.h3lis331dl_address <= 0x77 &&

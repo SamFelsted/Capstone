@@ -199,6 +199,20 @@ int main() {
   invalid_profile.esc_b_pin = invalid_profile.esc_a_pin;
   require(!melty::valid_board_profile(invalid_profile),
           "board profile must reject duplicate safety-critical pins");
+  melty::BoardProfile boundary_profile = esp;
+  boundary_profile.rc_min_us = melty::kPwmRcElectricalMinUs;
+  boundary_profile.rc_max_us = melty::kPwmRcElectricalMaxUs;
+  boundary_profile.esc_safe_us = 750;
+  boundary_profile.esc_max_us = 2250;
+  require(melty::valid_board_profile(boundary_profile),
+          "RC electrical and separate ESC endpoint boundaries should validate");
+  boundary_profile.rc_min_us = melty::kPwmRcElectricalMinUs - 1;
+  require(!melty::valid_board_profile(boundary_profile),
+          "profile must reject RC minimum outside capture range");
+  boundary_profile = esp;
+  boundary_profile.rc_max_us = melty::kPwmRcElectricalMaxUs + 1;
+  require(!melty::valid_board_profile(boundary_profile),
+          "profile must reject RC maximum outside capture range");
 
   FakeHal hal;
   melty::RuntimeConfig config{};

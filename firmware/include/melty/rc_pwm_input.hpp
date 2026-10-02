@@ -8,13 +8,17 @@
 
 namespace melty {
 
+inline constexpr std::uint32_t kPwmRcElectricalMinUs = 800;
+inline constexpr std::uint32_t kPwmRcElectricalMaxUs = 2200;
+inline constexpr std::uint32_t kPwmRcChannelTimeoutUs = 100000;
+
 struct PwmRcConfig {
   std::uint32_t pulse_min_us{1000};
   std::uint32_t pulse_center_us{1500};
   std::uint32_t pulse_max_us{2000};
-  std::uint32_t electrical_min_us{800};
-  std::uint32_t electrical_max_us{2200};
-  std::uint32_t channel_timeout_us{100000};
+  std::uint32_t electrical_min_us{kPwmRcElectricalMinUs};
+  std::uint32_t electrical_max_us{kPwmRcElectricalMaxUs};
+  std::uint32_t channel_timeout_us{kPwmRcChannelTimeoutUs};
 };
 
 struct PwmRcCapture {

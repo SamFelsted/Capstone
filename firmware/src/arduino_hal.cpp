@@ -14,10 +14,6 @@ constexpr std::uint8_t kControl1 = 0x20;
 constexpr std::uint8_t kControl4 = 0x23;
 constexpr std::uint8_t kStatus = 0x27;
 constexpr std::uint8_t kOutputXLow = 0x28;
-constexpr std::uint32_t kRcElectricalMinUs = 800;
-constexpr std::uint32_t kRcElectricalMaxUs = 2200;
-constexpr std::uint32_t kRcCaptureTimeoutUs = 100000;
-
 std::uint16_t clamp_pulse(long value, std::uint16_t low, std::uint16_t high) {
   return static_cast<std::uint16_t>(std::max<long>(low, std::min<long>(value, high)));
 }
@@ -31,8 +27,8 @@ ArduinoReferenceHal* ArduinoReferenceHal::instance_ = nullptr;
 ArduinoReferenceHal::ArduinoReferenceHal(const BoardProfile& profile)
     : profile_(profile),
       rc_assembler_({profile.rc_min_us, profile.rc_center_us,
-                     profile.rc_max_us, kRcElectricalMinUs,
-                     kRcElectricalMaxUs, kRcCaptureTimeoutUs}) {}
+                     profile.rc_max_us, kPwmRcElectricalMinUs,
+                     kPwmRcElectricalMaxUs, kPwmRcChannelTimeoutUs}) {}
 
 bool ArduinoReferenceHal::begin() {
   ready_ = false;
@@ -175,7 +171,8 @@ void ArduinoReferenceHal::on_rc_edge(unsigned channel) {
   } else if (rc_have_rise_[channel]) {
     const std::uint32_t width = now - rc_rise_us_[channel];
     rc_have_rise_[channel] = false;
-    if (width >= kRcElectricalMinUs && width <= kRcElectricalMaxUs) {
+    if (width >= kPwmRcElectricalMinUs &&
+        width <= kPwmRcElectricalMaxUs) {
       rc_pulse_us_[channel] = width;
       rc_end_us_[channel] = now;
       ++rc_sequence_[channel];
