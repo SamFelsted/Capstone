@@ -80,24 +80,69 @@ class SimulationWorker(QObject):
             status = self._simulator.snapshot().firmware
             if status.armed or self._command.arm:
                 raise ValueError("phase reset requires the robot to be disarmed")
+            # Commands are acquired only at absolute control boundaries. Hold
+            # reset through the next acquisition, receiver transport, and the
+            # first control boundary that can consume the delivered frame.
+            now_us = int(self._simulator.snapshot().time_us)
+            period_us = int(self._config.firmware.control_period_us)
+            next_acquisition_us = (now_us // period_us + 1) * period_us
+            delivered_us = next_acquisition_us + int(self._config.command_latency_us)
+            consumption_us = ((delivered_us + period_us - 1) // period_us) * period_us
+            advance_us = consumption_us - now_us
+            advance_ticks = advance_us // int(self._config.physics_tick_us)
+            if advance_ticks > 10_000:
+                raise ValueError(
+                    "synchronous phase-reset window exceeds the 10000-tick action budget; "
+                    "use lower receiver delay, a larger physics timestep, or Apply & Reset "
+                    "with the desired estimated phase")
+
             asserted = self._copy_command(self._command)
             asserted.reset_phase = True
-            self._command = asserted
-            self._simulator.set_command(asserted)
-            self._acknowledge_command(asserted)
-            # The pulse remains asserted for receiver delivery plus a complete
-            # firmware control period. Advancing here also makes the action work
-            # while paused and with deliberately slow control periods.
-            hold_us = (int(self._config.command_latency_us) +
-                       int(self._config.firmware.control_period_us) +
-                       int(self._config.physics_tick_us))
-            self._simulator.advance_for(hold_us)
-            cleared = self._copy_command(asserted)
-            cleared.reset_phase = False
-            self._command = cleared
-            self._simulator.set_command(cleared)
-            self._acknowledge_command(cleared)
-            self._emit_snapshot()
+            assertion_published = False
+            action_error = None
+            try:
+                self._command = asserted
+                self._simulator.set_command(asserted)
+                assertion_published = True
+                self._acknowledge_command(asserted)
+                self._simulator.advance_for(advance_us)
+                consumed = self._simulator.snapshot()
+                blocking_fault_mask = 0
+                for fault in (
+                    self.native.Fault.INVALID_CONFIGURATION,
+                    self.native.Fault.INVALID_ACCELERATION,
+                    self.native.Fault.STALE_ACCELERATION,
+                    self.native.Fault.INVALID_RC,
+                    self.native.Fault.STALE_RC,
+                    self.native.Fault.CONTROL_DEADLINE,
+                    self.native.Fault.HAL_ERROR,
+                    self.native.Fault.ACCELERATION_SATURATED,
+                    self.native.Fault.CONTROLLER_NUMERIC,
+                ):
+                    blocking_fault_mask |= int(fault)
+                if consumed.firmware.armed:
+                    raise RuntimeError("phase reset did not leave the robot disarmed")
+                if int(consumed.firmware.faults) & blocking_fault_mask:
+                    raise RuntimeError(
+                        "phase reset could not be consumed because firmware reported a blocking fault")
+                if abs(consumed.firmware.controller.phase_rad) > 1.0e-6:
+                    raise RuntimeError("firmware did not consume the phase reset command")
+            except Exception as exc:
+                action_error = exc
+            finally:
+                if assertion_published:
+                    try:
+                        cleared = self._copy_command(asserted)
+                        cleared.reset_phase = False
+                        self._command = cleared
+                        self._simulator.set_command(cleared)
+                        self._acknowledge_command(cleared)
+                    except Exception as clear_exc:
+                        if action_error is None:
+                            action_error = clear_exc
+                self._emit_snapshot()
+            if action_error is not None:
+                raise action_error
         except Exception as exc:
             self._fail(exc)
 

@@ -59,6 +59,10 @@ def test_integer_widths_and_reset_state_are_rejected_as_value_errors():
     document["initial_state"]["x_m"] = 1.0e7
     with pytest.raises(ValueError, match="initial_state"):
         config_codec.from_document(melty_sim, document)
+    document = config_codec.to_document(config, state)
+    document["config"]["physical"]["mass_kg"] = 10 ** 1000
+    with pytest.raises(ValueError, match="mass_kg"):
+        config_codec.from_document(melty_sim, document)
 
 
 def test_simulator_config_property_is_a_deep_copy():
@@ -137,15 +141,77 @@ def test_apply_while_arm_requested_cannot_resurrect_arm_on_phase_reset(app):
     assert window.close()
 
 
-def test_paused_phase_reset_survives_slow_control_period(app):
+@pytest.mark.parametrize("latency_us", [2_000, 1])
+def test_paused_phase_reset_hits_absolute_control_boundary_and_replays(app, latency_us):
     window = MainWindow(); spin_events(app, 100)
     document = config_codec.to_document(window.config, window.initial_state)
     document["config"]["firmware"]["control_period_us"] = 15_000
+    document["config"]["command_latency_us"] = latency_us
+    document["initial_state"]["estimated_phase_rad"] = 1.0
     window.apply_document(document); spin_events(app, 120)
+    assert window.snapshot.firmware.controller.phase_rad == pytest.approx(1.0)
     window._epoch_events.clear(); before = window.snapshot.time_us
     window._zero_phase(); spin_events(app, 120)
-    assert [e["reset_phase"] for e in window._epoch_events[-2:]] == [True, False]
-    assert window.snapshot.time_us - before >= 17_250
+    events = list(window._epoch_events)
+    assert [e["reset_phase"] for e in events] == [True, False]
+    assert window.snapshot.time_us == 30_000
+    assert window.snapshot.firmware.controller.phase_rad == pytest.approx(0.0, abs=1e-6)
+    assert "Rejected:" not in window.statusBar().currentMessage()
+
+    config, state = config_codec.from_document(melty_sim, document)
+    replay = melty_sim.Simulator(config); replay.reset(state)
+    cursor = 0
+    for event in events:
+        replay.advance_for(event["time_us"] - cursor); cursor = event["time_us"]
+        command = melty_sim.UserCommand()
+        for name in ("spin", "translate_x", "translate_y", "arm", "reset_phase"):
+            setattr(command, name, event[name])
+        replay.set_command(command)
+    replay.advance_for(window.snapshot.time_us - cursor)
+    replayed = replay.snapshot()
+    assert replayed.firmware.controller.phase_rad == pytest.approx(
+        window.snapshot.firmware.controller.phase_rad, abs=1e-10)
+    for name in ("x_m", "y_m", "heading_rad", "vx_mps", "vy_mps", "spin_rad_s"):
+        assert getattr(replayed, name) == pytest.approx(
+            getattr(window.snapshot, name), abs=1e-10)
+    assert window.close()
+
+
+def test_phase_reset_reports_sensor_fault_and_still_clears_pulse(app):
+    window = MainWindow(); spin_events(app, 100)
+    document = config_codec.to_document(window.config, window.initial_state)
+    document["config"]["sensor"]["max_acceleration_mps2"] = 1.0e-6
+    document["initial_state"]["estimated_phase_rad"] = 1.0
+    window.apply_document(document); spin_events(app, 100)
+    window._epoch_events.clear()
+    window._zero_phase(); spin_events(app, 100)
+    assert [event["reset_phase"] for event in window._epoch_events] == [True, False]
+    assert "blocking fault" in window.statusBar().currentMessage()
+    assert not window.start_button.isChecked()
+    assert window.close()
+
+
+def test_phase_reset_rejects_long_synchronous_window_before_asserting(app):
+    window = MainWindow(); spin_events(app, 100)
+    document = config_codec.to_document(window.config, window.initial_state)
+    document["config"]["physics_tick_us"] = 1
+    document["config"]["firmware"]["control_period_us"] = 101
+    document["config"]["command_latency_us"] = 10_000_000
+    window.apply_document(document); spin_events(app, 120)
+    assert window.snapshot.time_us == 0
+    window._epoch_events.clear()
+    original = (window.command.spin, window.command.translate_x,
+                window.command.translate_y, window.command.arm,
+                window.command.reset_phase)
+    window._zero_phase(); spin_events(app, 100)
+    assert window.snapshot.time_us == 0
+    assert window._epoch_events == []
+    assert (window.command.spin, window.command.translate_x,
+            window.command.translate_y, window.command.arm,
+            window.command.reset_phase) == original
+    message = window.statusBar().currentMessage()
+    assert "exceeds the 10000-tick action budget" in message
+    assert "Apply & Reset" in message
     assert window.close()
 
 

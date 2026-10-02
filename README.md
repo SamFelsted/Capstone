@@ -41,9 +41,13 @@ separate. Reference presets live in `sim/config/robot.json` and
 `sim/config/scenario.json`; each includes the schema version, full configuration,
 seed, and initial state.
 
-Zero Phase is available only while disarmed. The worker holds its RC command for
-receiver latency plus a complete firmware control period in simulated time, so it
-also works while paused and does not depend on UI or render timing.
+Zero Phase is available only while disarmed. The worker holds its RC command from
+the next absolute acquisition boundary through transport and the control boundary
+that consumes it, so the action works while paused and does not depend on UI or
+render timing. This synchronous action is limited to 10,000 physics ticks to keep
+the interface responsive. Longer configured transport windows remain valid for
+fault experiments; use a lower receiver delay, a larger physics timestep, or
+Apply & Reset with an estimated phase for those scenarios.
 
 `scenario.json` is a calibrated single-speed reference demo: load it, arm at zero
 spin, then command 25% spin and a +X translation demand. Its 2.15 rad translation

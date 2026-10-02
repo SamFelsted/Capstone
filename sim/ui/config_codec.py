@@ -110,8 +110,13 @@ def _assign(target: Any, source: dict[str, Any], names: tuple[str, ...], path: s
             low, high = INTEGER_LIMITS[name]
             if not low <= raw <= high:
                 raise ValueError(f"{path}.{name} must be in [{low}, {high}]")
-        elif not math.isfinite(float(raw)):
-            raise ValueError(f"{path}.{name} must be finite")
+        else:
+            try:
+                converted = float(raw)
+            except (TypeError, OverflowError, ValueError) as exc:
+                raise ValueError(f"{path}.{name} must be a finite number") from exc
+            if not math.isfinite(converted):
+                raise ValueError(f"{path}.{name} must be finite")
         try:
             setattr(target, name, raw)
         except (TypeError, OverflowError, ValueError) as exc:
