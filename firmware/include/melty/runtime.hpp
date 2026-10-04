@@ -41,6 +41,7 @@ class Runtime {
   RuntimeStatus status_{};
   AccelerationSample acceleration_{};
   RcCommand command_{};
+  bool have_command_{false};
   unsigned arm_ticks_{0};
   Micros last_arm_frame_us_{0};
   bool have_arm_frame_{false};

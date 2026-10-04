@@ -55,7 +55,21 @@ phase offset was tuned for the reference model near 112 rad/s. It illustrates th
 calibration workflow; changing speed, latency, geometry, or dynamics can change the
 required offset and does not guarantee the same world-frame heading.
 
-The Telemetry tab can record CSV samples plus a neighboring JSON metadata file
+The main window puts live controls and telemetry beside the arena; every
+structural setting and preset lives behind **⚙ Settings**. The **direction dial**
+sets translation angle (0° = +X, 90° = +Y) and strength (distance from centre);
+its cyan dot marks the robot's actual direction of travel. With **World-aligned
+steering** on (the default) the dial is in world coordinates: the controls rotate
+the demand into the firmware's phase frame, cancelling phase-estimate drift and
+the speed-dependent motor/latency lag, and trim the remainder from the measured,
+revolution-averaged drive force. It stands in for a driver watching the robot and
+uses simulation truth; turn it off to send the dial angle to firmware unchanged. **Sim speed** scales simulated time from 0.001× to 4× real time, which
+is how individual rotations become visible. With **Motor vectors** on, hover any
+arrow for a summary or click it for a live derivation that recomputes the value
+from the inputs firmware or the plant consumed and checks it against the native
+result.
+
+The telemetry panel can record CSV samples plus a neighboring JSON metadata file
 using the `meltybrain-simulator-recording` v1 schema shared with the CLI. It
 contains the epoch's initial state, full configuration, seed, exact worker-accepted
 command events, duration, and final state. Starting midway through an epoch writes

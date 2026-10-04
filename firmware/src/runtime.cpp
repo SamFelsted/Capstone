@@ -48,6 +48,7 @@ void Runtime::reset(double phase_reference_rad) {
   }
   acceleration_ = {};
   command_ = {};
+  have_command_ = false;
   arm_ticks_ = 0;
   last_arm_frame_us_ = 0;
   have_arm_frame_ = false;
@@ -61,8 +62,13 @@ void Runtime::disarm(Fault fault) {
   status_.armed = false;
   status_.arm_interlock_satisfied = false;
   arm_ticks_ = 0;
-  last_arm_frame_us_ = command_.timestamp_us;
-  have_arm_frame_ = true;
+  // Consume the current frame so it cannot re-establish the interlock. Before
+  // any frame has been received there is nothing to consume, and marking the
+  // default timestamp would swallow a genuine first frame stamped at zero.
+  if (have_command_) {
+    last_arm_frame_us_ = command_.timestamp_us;
+    have_arm_frame_ = true;
+  }
   controller_.disable_output();
   status_.output = {};
 }
@@ -98,6 +104,7 @@ void Runtime::tick() {
     active_faults |= Fault::invalid_rc;
   } else {
     command_ = new_command;
+    have_command_ = true;
     status_.last_rc_us = command_.timestamp_us;
   }
   // HAL reads may advance the clock and timestamp samples at acquisition

@@ -412,6 +412,8 @@ Snapshot Simulator::snapshot() const {
     result.sensed_acceleration = *delivered;
   }
   result.firmware = impl_->runtime.status();
+  result.consumed_acceleration = impl_->hal.last_read_acceleration();
+  result.consumed_command = impl_->hal.last_read_rc();
   return result;
 }
 

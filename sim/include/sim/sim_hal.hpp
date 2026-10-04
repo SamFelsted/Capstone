@@ -20,6 +20,9 @@ class SimHal final : public Hal {
   void publish_rc(const RcCommand& command);
   const MotorOutput& motor_output() const;
   const AccelerationSample* delivered_acceleration() const;
+  // Values most recently returned to firmware through read_*().
+  const AccelerationSample& last_read_acceleration() const;
+  const RcCommand& last_read_rc() const;
 
  private:
   Micros now_us_{0};
@@ -28,6 +31,8 @@ class SimHal final : public Hal {
   MotorOutput motors_{};
   bool acceleration_available_{false};
   bool command_available_{false};
+  AccelerationSample last_read_acceleration_{};
+  RcCommand last_read_rc_{};
 };
 
 }  // namespace melty::sim

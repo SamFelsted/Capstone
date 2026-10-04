@@ -217,6 +217,7 @@ def test_phase_reset_rejects_long_synchronous_window_before_asserting(app):
 
 def test_rapid_commands_are_copied_and_acknowledged_in_order(app):
     window = MainWindow(); spin_events(app, 120)
+    window.spin_limit_check.setChecked(False); spin_events(app, 60)  # transport test: raw values
     window._epoch_events.clear()
     for value in (110, 420, 870):
         window.spin_slider.setValue(value)
@@ -263,4 +264,129 @@ def test_recording_replays_to_final_state(app, tmp_path):
     replayed = simulator.snapshot()
     for name, expected in metadata["final_state"].items():
         assert getattr(replayed, name) == pytest.approx(expected, abs=1e-10)
+    assert window.close()
+
+
+def test_arm_before_start_spins_up_and_speed_slider_slows_time(app):
+    window = MainWindow(); spin_events(app, 100)
+    window.arm_button.setChecked(True); spin_events(app, 50)
+    assert window.arm_button.text() == "PRESS START"
+    window.start_button.click(); spin_events(app, 300)
+    assert window.snapshot.firmware.armed
+    assert window.arm_button.text() == "ARMED"
+    window.spin_slider.setValue(250); spin_events(app, 1000)
+    assert window.snapshot.spin_rad_s > 20.0
+
+    window.speed_slider.setValue(-200); spin_events(app, 100)
+    assert window.speed_label.text() == "0.010×"
+    before = window.snapshot.time_us
+    spin_events(app, 500)
+    # 0.5 s of wall time at 0.01x is about 5 ms of simulated time.
+    assert 0 < window.snapshot.time_us - before < 50_000
+
+    window.vectors_check.setChecked(False)
+    assert not window.arena.show_vectors
+    assert window.close()
+
+
+def test_vector_derivations_match_native_values():
+    from sim.ui import vector_math
+    config, state = config_codec.load(melty_sim, Path(__file__).parents[1] / "sim" / "config" / "scenario.json")
+    simulator = melty_sim.Simulator(config); simulator.reset(state)
+    command = melty_sim.UserCommand(); command.arm = True
+    simulator.set_command(command); simulator.advance_for(20_000)
+    command.spin = 0.25; command.translate_x = 0.6; command.translate_y = 0.3
+    simulator.set_command(command)
+    checked = 0
+    for _ in range(400):
+        simulator.advance_ticks(11)
+        snapshot = simulator.snapshot()
+        for key in vector_math.VECTORS:
+            derivation = vector_math.derive(key, snapshot, config)
+            assert vector_math.to_html(derivation)
+            for check in derivation.checks:
+                assert check.ok, (key, check.name, check.recomputed, check.reported)
+                checked += 1
+    assert snapshot.firmware.armed and checked > 0
+
+
+def test_direction_dial_drives_translation_command(app):
+    window = MainWindow(); spin_events(app, 100)
+    window._dial_changed(90.0, 0.5)
+    assert window.command.translate_x == pytest.approx(0.0, abs=1e-9)
+    assert window.command.translate_y == pytest.approx(0.5)
+    window.direction_slider.setValue(-1800); window.strength_slider.setValue(1000)
+    assert window.direction_dial.angle_deg == pytest.approx(-180.0)
+    assert window.direction_dial.strength == pytest.approx(1.0)
+    assert window.close()
+
+
+def test_clicking_vectors_opens_live_math_and_settings_live_in_dialog(app):
+    window = MainWindow(); window.show(); spin_events(app, 150)
+    window.arm_button.setChecked(True); window.start_button.click(); spin_events(app, 150)
+    window.spin_slider.setValue(250); spin_events(app, 400)
+    window.arena.repaint()
+    midpoints = {key: (a + b) / 2 for key, a, b in reversed(window.arena._hits)}
+    assert set(midpoints) == {"wheel_a", "wheel_b", "net_force", "velocity", "steering"}
+    assert window.arena._hit(midpoints["wheel_a"]) == "wheel_a"
+    window.arena.select("wheel_a"); spin_events(app, 100)
+    assert window.arena.overlay.isVisible()
+    assert "Wheel A motor command" in window.arena.overlay_text.text()
+    window.vectors_check.setChecked(False)
+    assert not window.arena.overlay.isVisible()
+    assert window.editors["physical.mass_kg"].window() is window.settings_dialog
+    assert window.close()
+
+
+def test_realtime_button_and_motors_off_banner(app):
+    window = MainWindow(); window.show(); spin_events(app, 100)
+    window.speed_slider.setValue(-150)
+    window.realtime_button.click()
+    assert window.speed_slider.value() == 0 and window.speed_label.text() == "1.00×"
+    window.start_button.click(); spin_events(app, 100)
+    window.spin_slider.setValue(500); spin_events(app, 100)  # firmware sees a disarmed high-spin frame
+    window.arm_button.setChecked(True); spin_events(app, 200)
+    assert not window.snapshot.firmware.armed
+    assert window.arm_button.text() == "ARM BLOCKED"
+    assert window.arena.banner and "spin demand" in window.arena.banner
+    window.arena.repaint()
+    assert {key for key, _ in window.arena._legend_hits} == {"wheel_a", "wheel_b", "net_force", "velocity", "steering"}
+    window._show_settings(); spin_events(app, 50)
+    window.settings_close_button.click(); spin_events(app, 50)
+    assert not window.settings_dialog.isVisible()
+    assert window.close()
+
+
+def test_world_aligned_steering_pushes_where_the_dial_points(app):
+    import math
+    window = MainWindow(); window.show(); spin_events(app, 100)
+    window.arm_button.setChecked(True); window.start_button.click(); spin_events(app, 100)
+    window.spin_slider.setValue(250); spin_events(app, 1500)
+    window._dial_changed(30.0, 1.0)
+    start = (window.snapshot.x_m, window.snapshot.y_m)
+    spin_events(app, 2500)
+    state = window.steering.state
+    assert state.push_rad is not None
+    assert abs(math.degrees(math.remainder(state.push_rad - math.radians(30.0), 2 * math.pi))) < 10.0
+    moved = (window.snapshot.x_m - start[0], window.snapshot.y_m - start[1])
+    assert math.hypot(*moved) > 0.005
+    assert abs(math.degrees(math.remainder(math.atan2(moved[1], moved[0]) - math.radians(30.0), 2 * math.pi))) < 35.0
+    window.arena.select("steering"); spin_events(app, 50)
+    assert "World → firmware frame" in window.arena.overlay_text.text()
+    assert window.close()
+
+
+def test_spin_limiter_keeps_motors_on_and_disarm_reason_is_latched(app):
+    window = MainWindow(); window.show(); spin_events(app, 100)
+    window.arm_button.setChecked(True); window.start_button.click(); spin_events(app, 100)
+    window.spin_slider.setValue(790); spin_events(app, 4000)
+    ceiling = window._spin_ceiling()
+    assert window.command.spin == pytest.approx(ceiling)
+    assert window.snapshot.firmware.armed
+    assert "capped" in window.spin_value.text()
+
+    window.spin_limit_check.setChecked(False); spin_events(app, 3000)
+    assert not window.snapshot.firmware.armed
+    assert "ACCELERATION SATURATED" in (window._last_disarm or "")
+    assert window.arena.banner and "ACCELERATION SATURATED" in window.arena.banner
     assert window.close()

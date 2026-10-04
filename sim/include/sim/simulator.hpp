@@ -95,6 +95,13 @@ struct Snapshot {
   RuntimeStatus firmware{};
   WheelTelemetry wheel_a{};
   WheelTelemetry wheel_b{};
+  // World-frame wheel drive force (longitudinal only) low-passed with a
+  // 0.15 s time constant: the net push averaged over revolutions.
+  double mean_drive_force_x_n{0.0};
+  double mean_drive_force_y_n{0.0};
+  // Inputs firmware consumed on its most recent control tick.
+  AccelerationSample consumed_acceleration{};
+  RcCommand consumed_command{};
 };
 
 class Simulator {

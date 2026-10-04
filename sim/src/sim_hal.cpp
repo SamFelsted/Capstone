@@ -9,6 +9,7 @@ bool SimHal::read_acceleration(AccelerationSample& sample) {
     return false;
   }
   sample = acceleration_;
+  last_read_acceleration_ = acceleration_;
   return true;
 }
 
@@ -17,6 +18,7 @@ bool SimHal::read_rc(RcCommand& command) {
     return false;
   }
   command = command_;
+  last_read_rc_ = command_;
   return true;
 }
 
@@ -29,6 +31,8 @@ void SimHal::reset() {
   motors_ = {};
   acceleration_available_ = false;
   command_available_ = false;
+  last_read_acceleration_ = {};
+  last_read_rc_ = {};
 }
 
 void SimHal::set_now(Micros now_us) { now_us_ = now_us; }
@@ -48,5 +52,11 @@ const MotorOutput& SimHal::motor_output() const { return motors_; }
 const AccelerationSample* SimHal::delivered_acceleration() const {
   return acceleration_available_ ? &acceleration_ : nullptr;
 }
+
+const AccelerationSample& SimHal::last_read_acceleration() const {
+  return last_read_acceleration_;
+}
+
+const RcCommand& SimHal::last_read_rc() const { return last_read_rc_; }
 
 }  // namespace melty::sim

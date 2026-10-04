@@ -10,6 +10,7 @@ namespace melty::sim {
 namespace {
 
 constexpr double kGravityMps2 = 9.80665;
+constexpr double kMeanForceTimeConstantS = 0.15;
 constexpr double kPi = 3.14159265358979323846;
 constexpr std::size_t kMaximumSubsteps = 100;
 
@@ -154,6 +155,16 @@ class Plant::Impl {
     y += vy * dt;
     heading = wrap_angle(heading + spin * dt);
 
+    // Low-pass the world-frame drive force (both wheels' longitudinal forces;
+    // lateral scrub and drag excluded). Over several revolutions this is the
+    // net push the spinning robot delivers. The total force is not used: at
+    // terminal velocity it averages to zero by definition.
+    const double drive_x_world = -s * force_y_body;
+    const double drive_y_world = c * force_y_body;
+    const double mean_alpha = 1.0 - std::exp(-dt / kMeanForceTimeConstantS);
+    mean_force_x += mean_alpha * (drive_x_world - mean_force_x);
+    mean_force_y += mean_alpha * (drive_y_world - mean_force_y);
+
     telemetry_a.command = command_a;
     telemetry_a.motor_current_a = motor_a_result.current_a;
     telemetry_a.wheel_speed_rad_s = motor_a_result.wheel_speed_rad_s;
@@ -178,6 +189,8 @@ class Plant::Impl {
   double x{0.0};
   double y{0.0};
   double heading{0.0};
+  double mean_force_x{0.0};
+  double mean_force_y{0.0};
   double vx{0.0};
   double vy{0.0};
   double spin{0.0};
@@ -207,6 +220,8 @@ void Plant::reset(const ResetState& state) {
   impl_->vy = state.vy_mps;
   impl_->spin = state.spin_rad_s;
   impl_->acceleration_body = {};
+  impl_->mean_force_x = 0.0;
+  impl_->mean_force_y = 0.0;
   const double wheel_speed =
       state.spin_rad_s * impl_->config.wheel_offset_m /
       impl_->config.wheel_radius_m;
@@ -323,6 +338,8 @@ Snapshot Plant::snapshot(Micros now_us) const {
   result.spin_rad_s = impl_->spin;
   result.wheel_a = impl_->telemetry_a;
   result.wheel_b = impl_->telemetry_b;
+  result.mean_drive_force_x_n = impl_->mean_force_x;
+  result.mean_drive_force_y_n = impl_->mean_force_y;
   return result;
 }
 

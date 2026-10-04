@@ -30,6 +30,7 @@ class SimulationWorker(QObject):
         self._last_wall_ns = 0
         self._last_render_ns = 0
         self._accumulated_us = 0
+        self._time_scale = 1.0
         self._command = native.UserCommand()
 
     @Slot()
@@ -152,6 +153,11 @@ class SimulationWorker(QObject):
         self._last_wall_ns = time.monotonic_ns()
         self.running_changed.emit(self._running)
 
+    @Slot(float)
+    def set_time_scale(self, scale):
+        """Simulated seconds advanced per wall-clock second."""
+        self._time_scale = max(0.0, float(scale))
+
     @Slot()
     def step(self):
         if self._simulator is None or self._running:
@@ -240,7 +246,8 @@ class SimulationWorker(QObject):
         # Preserve fractional time across pumps. Cap one second of backlog: under
         # sustained overload the simulator deliberately slows instead of freezing
         # the UI while attempting an unbounded catch-up.
-        self._accumulated_us = min(self._accumulated_us + elapsed_us, 1_000_000)
+        self._accumulated_us = min(
+            self._accumulated_us + elapsed_us * self._time_scale, 1_000_000)
         ticks = min(200, int(self._accumulated_us // tick_us))
         try:
             if ticks:

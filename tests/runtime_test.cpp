@@ -175,6 +175,34 @@ void test_hardware_enable_handshake() {
           "new arm-low frame after hardware enable may reset interlock");
 }
 
+void test_first_frame_after_startup_fault() {
+  // A tick before the receiver delivers anything faults; the first real frame,
+  // even one stamped at zero, must still be able to establish the interlock.
+  FakeHal hal;
+  melty::RuntimeConfig config{};
+  config.arm_confirm_ticks = 2;
+  melty::Runtime runtime(hal, config);
+  hal.rc_ok = false;
+  hal.now = 1000;
+  hal.acceleration.timestamp_us = 1000;
+  runtime.tick();
+  require(has(runtime.status().faults, melty::Fault::hal_error),
+          "missing first RC frame should fault");
+  hal.rc_ok = true;
+  hal.command = {};
+  hal.command.timestamp_us = 0;
+  hal.now = 2000;
+  hal.acceleration.timestamp_us = 2000;
+  runtime.tick();
+  require(runtime.status().arm_interlock_satisfied,
+          "first arm-low frame stamped at zero should establish interlock");
+  hal.command.arm = true;
+  tick_at(hal, runtime, 3000);
+  tick_at(hal, runtime, 4000);
+  require(runtime.status().armed,
+          "arm-high frames after the first low frame should arm");
+}
+
 void test_numeric_fail_closed() {
   FakeHal hal;
   melty::RuntimeConfig config{};
@@ -250,6 +278,7 @@ void test_acquisition_timestamp_semantics() {
 int main() {
   test_pwm_frame_assembly();
   test_hardware_enable_handshake();
+  test_first_frame_after_startup_fault();
   test_numeric_fail_closed();
   test_acquisition_timestamp_semantics();
 

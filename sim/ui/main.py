@@ -13,9 +13,9 @@ from pathlib import Path
 from PySide6.QtCore import QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QAction, QCloseEvent
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout,
+    QApplication, QCheckBox, QDialog, QFileDialog, QFormLayout, QFrame, QHBoxLayout,
     QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QScrollArea,
-    QSlider, QSplitter, QTabWidget, QVBoxLayout, QWidget,
+    QSizePolicy, QSlider, QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
 
 try:
@@ -24,7 +24,8 @@ except ImportError as exc:  # pragma: no cover - exercised by launch failure
     raise SystemExit("melty_sim was not found. Build it and set PYTHONPATH=build/python") from exc
 
 from . import config_codec
-from .widgets import ArenaWidget, TelemetryPlot
+from .widgets import ArenaWidget, DirectionDial, TelemetryPlot
+from .steering import WorldSteering
 from .worker import SimulationWorker
 
 
@@ -40,6 +41,9 @@ FAULTS = (
     ("PHASE INVALID", native.Fault.PHASE_INVALID),
     ("HAL ERROR", native.Fault.HAL_ERROR),
 )
+
+# Spin demand is capped to this fraction of what the accelerometer can measure.
+SPIN_SENSOR_MARGIN = 0.9
 
 LABELS = {
     "mass_kg": "Mass [kg]", "body_radius_m": "Body radius [m]",
@@ -86,6 +90,7 @@ class MainWindow(QMainWindow):
     shutdown_requested = Signal()
     recording_boundary_requested = Signal()
     phase_reset_requested = Signal()
+    time_scale_requested = Signal(float)
 
     def __init__(self):
         super().__init__()
@@ -97,6 +102,9 @@ class MainWindow(QMainWindow):
         self.command = native.UserCommand()
         self.snapshot = None
         self.editors = {}
+        self.steering = WorldSteering()
+        self._was_armed = False
+        self._last_disarm = None
         self._epoch_events = []
         self._epoch_spool = self._epoch_spool_writer = None
         self._recording_document = None
@@ -123,6 +131,7 @@ class MainWindow(QMainWindow):
         self.shutdown_requested.connect(self.worker.shutdown)
         self.recording_boundary_requested.connect(self.worker.capture_recording_boundary)
         self.phase_reset_requested.connect(self.worker.request_phase_reset)
+        self.time_scale_requested.connect(self.worker.set_time_scale)
         self.worker.snapshot_ready.connect(self._snapshot)
         self.worker.running_changed.connect(self._running_changed)
         self.worker.config_applied.connect(self._config_applied)
@@ -145,39 +154,156 @@ class MainWindow(QMainWindow):
         toolbar.setMovable(False)
         self.start_button = QPushButton("▶  START"); self.start_button.setObjectName("start_button")
         self.start_button.setCheckable(True); self.start_button.clicked.connect(self._toggle_run)
+        self.start_button.setToolTip("Run or pause simulated time.")
         self.step_button = QPushButton("STEP"); self.step_button.setObjectName("step_button")
         self.step_button.clicked.connect(self.step_requested)
+        self.step_button.setToolTip("Advance one physics tick while paused.")
         reset = QPushButton("RESET"); reset.setObjectName("reset_button"); reset.clicked.connect(self._reset)
+        reset.setToolTip("Return to the initial state, disarm, and clear history.")
         for widget in (self.start_button, self.step_button, reset): toolbar.addWidget(widget)
         toolbar.addSeparator()
         self.arm_button = QPushButton("DISARMED"); self.arm_button.setObjectName("arm_button")
         self.arm_button.setCheckable(True); self.arm_button.toggled.connect(self._command_changed)
         toolbar.addWidget(self.arm_button)
         phase = QPushButton("ZERO PHASE"); phase.clicked.connect(self._zero_phase); toolbar.addWidget(phase)
+        phase.setToolTip("While disarmed, declare the robot's current orientation as phase 0\n"
+                         "(the reference the direction dial is measured from).")
+        toolbar.addSeparator()
+        toolbar.addWidget(QLabel("Sim speed"))
+        # Logarithmic: slider value v maps to 10^(v/100)x real time, 0.001x to 4x.
+        self.speed_slider = QSlider(Qt.Orientation.Horizontal); self.speed_slider.setObjectName("speed_slider")
+        self.speed_slider.setRange(-300, 60); self.speed_slider.setValue(0); self.speed_slider.setFixedWidth(160)
+        self.speed_slider.setToolTip("Simulated time per real second. Slow down to watch individual rotations.")
+        self.speed_slider.valueChanged.connect(self._speed_changed); toolbar.addWidget(self.speed_slider)
+        self.speed_label = QLabel("1.000×"); self.speed_label.setFixedWidth(56); toolbar.addWidget(self.speed_label)
+        self.realtime_button = QPushButton("1×"); self.realtime_button.setObjectName("realtime_button")
+        self.realtime_button.setToolTip("Snap simulation speed back to real time.")
+        self.realtime_button.clicked.connect(lambda: self.speed_slider.setValue(0)); toolbar.addWidget(self.realtime_button)
         toolbar.addSeparator()
         self.time_label = QLabel("  t = 0.000 s  "); toolbar.addWidget(self.time_label)
         self.state_label = QLabel("SIM PAUSED"); self.state_label.setObjectName("state_badge"); toolbar.addWidget(self.state_label)
+        spacer = QWidget(); spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        toolbar.addWidget(spacer)
+        self.settings_button = QPushButton("⚙  SETTINGS"); self.settings_button.setObjectName("settings_button")
+        self.settings_button.setToolTip("Robot, sensor, firmware and simulation configuration, and presets.")
+        self.settings_button.clicked.connect(self._show_settings); toolbar.addWidget(self.settings_button)
 
         splitter = QSplitter(); self.setCentralWidget(splitter)
         arena_frame = QFrame(); arena_layout = QVBoxLayout(arena_frame)
-        title = QLabel("ARENA / PHYSICAL TRUTH"); title.setObjectName("section_title"); arena_layout.addWidget(title)
+        header = QHBoxLayout()
+        title = QLabel("ARENA / PHYSICAL TRUTH"); title.setObjectName("section_title"); header.addWidget(title)
+        header.addStretch()
+        self.vectors_check = QCheckBox("Motor vectors"); self.vectors_check.setObjectName("vectors_check")
+        self.vectors_check.setToolTip("Show wheel commands, net tire force and velocity.\n"
+                                      "Hover a vector for a summary; click it for the live math.")
+        self.vectors_check.setChecked(True); header.addWidget(self.vectors_check)
+        arena_layout.addLayout(header)
         self.arena = ArenaWidget(); arena_layout.addWidget(self.arena, 1); splitter.addWidget(arena_frame)
-        self.tabs = QTabWidget(); splitter.addWidget(self.tabs); splitter.setSizes([780, 580])
-        self.tabs.addTab(self._controls_tab(), "Controls")
-        self.tabs.addTab(self._telemetry_tab(), "Telemetry")
+        self.vectors_check.toggled.connect(self.arena.set_show_vectors)
+        side = QScrollArea(); side.setWidgetResizable(True); side.setFrameShape(QFrame.Shape.NoFrame)
+        side.setWidget(self._side_panel()); splitter.addWidget(side); splitter.setSizes([820, 540])
+        self.settings_dialog = self._settings_dialog()
         self._menu()
 
-    def _controls_tab(self):
+    def _side_panel(self):
         body = QWidget(); layout = QVBoxLayout(body)
-        live = QFrame(); form = QFormLayout(live)
+        title = QLabel("LIVE CONTROLS"); title.setObjectName("section_title"); layout.addWidget(title)
+        form = QFormLayout()
         self.spin_slider = QSlider(Qt.Orientation.Horizontal); self.spin_slider.setRange(0, 1000)
-        self.spin_slider.valueChanged.connect(self._command_changed); form.addRow("Spin demand", self.spin_slider)
+        self.spin_slider.setToolTip("Spin demand as a fraction of the firmware's maximum spin.\n"
+                                    "Must be at or below the arm limit when arming.")
+        self.spin_slider.valueChanged.connect(self._command_changed)
+        spin_hint = ("How fast you ask the robot to spin, as a fraction of the firmware's maximum spin\n"
+                     "(⚙ Firmware assumptions › Maximum spin). The spin controller holds that target speed.\n"
+                     "Faster spin hits harder but needs more steering lag compensation, and arming requires\n"
+                     "it to be at or below the arm limit (⚙ Firmware runtime › Arm spin maximum).")
+        spin_label = QLabel("Spin demand"); spin_label.setToolTip(spin_hint); self.spin_slider.setToolTip(spin_hint)
+        self.spin_value = QLabel("0% → 0 rad/s"); self.spin_value.setToolTip(spin_hint); self.spin_value.setMinimumWidth(110)
+        self.spin_value.setTextFormat(Qt.TextFormat.RichText)
+        spin_row = QHBoxLayout(); spin_row.addWidget(self.spin_slider, 1); spin_row.addWidget(self.spin_value)
+        form.addRow(spin_label, spin_row)
+        self.spin_limit_check = QCheckBox("Limit spin to accelerometer range"); self.spin_limit_check.setObjectName("spin_limit_check")
+        self.spin_limit_check.setChecked(True)
+        self.spin_limit_check.setToolTip(
+            "The firmware disarms (ACCELERATION SATURATED) when radial acceleration ω²·r reaches the\n"
+            "accelerometer's range (⚙ Physical sensor › Sensor limit). With this on, spin demand is capped\n"
+            f"at {SPIN_SENSOR_MARGIN:.0%} of the fastest measurable spin so the motors stay on.\n"
+            "Turn it off to test saturation behaviour deliberately.")
+        self.spin_limit_check.toggled.connect(self._command_changed)
+        form.addRow("", self.spin_limit_check)
+        # Backing values for the dial; kept as sliders so recordings and tests
+        # address the same command fields.
         self.direction_slider = QSlider(Qt.Orientation.Horizontal); self.direction_slider.setRange(-1800, 1800)
-        self.direction_slider.valueChanged.connect(self._command_changed); form.addRow("Translate direction [°]", self.direction_slider)
+        self.direction_slider.valueChanged.connect(self._command_changed); self.direction_slider.hide()
         self.strength_slider = QSlider(Qt.Orientation.Horizontal); self.strength_slider.setRange(0, 1000)
-        self.strength_slider.valueChanged.connect(self._command_changed); form.addRow("Translate strength", self.strength_slider)
-        self.demand_label = QLabel("spin 0.000 · translate 0.000 @ 0.0°"); form.addRow("Live command", self.demand_label)
-        layout.addWidget(live)
+        self.strength_slider.valueChanged.connect(self._command_changed); self.strength_slider.hide()
+        layout.addLayout(form)
+        dial_row = QHBoxLayout()
+        self.direction_dial = DirectionDial(); self.direction_dial.setObjectName("direction_dial")
+        self.direction_dial.changed.connect(self._dial_changed)
+        dial_row.addWidget(self.direction_dial, 1)
+        legend = QLabel("<b>Translate</b><br><span style='color:#ffd166'>●</span> demand<br>"
+                        "<span style='color:#76d5f7'>●</span> actual travel<br><br>"
+                        "<span style='color:#7f91a8'>drag to steer<br>shift snaps 15°<br>right-click stops</span>")
+        legend.setTextFormat(Qt.TextFormat.RichText); legend.setAlignment(Qt.AlignmentFlag.AlignTop)
+        dial_row.addWidget(legend)
+        layout.addLayout(dial_row)
+        self.demand_label = QLabel("translate 0% @ +0.0° world"); self.demand_label.setObjectName("hint")
+        layout.addWidget(self.demand_label)
+        self.steering_check = QCheckBox("World-aligned steering"); self.steering_check.setObjectName("steering_check")
+        self.steering_check.setChecked(True)
+        self.steering_check.setToolTip(
+            "On: the dial is in world coordinates and the robot pushes where it points.\n"
+            "The controls rotate your demand into the firmware's phase frame, cancelling the\n"
+            "phase-estimate drift and the speed-dependent motor/latency lag, then trim the rest\n"
+            "from the measured push. This stands in for a driver watching the robot.\n"
+            "Off: the dial angle goes to firmware unchanged (raw phase frame).")
+        self.steering_check.toggled.connect(self._steering_toggled)
+        layout.addWidget(self.steering_check)
+
+        title = QLabel("TELEMETRY"); title.setObjectName("section_title"); layout.addWidget(title)
+        self.telemetry = TelemetryPlot(); self.telemetry.setMinimumHeight(200); layout.addWidget(self.telemetry)
+        grid = QFormLayout()
+        self.actual_spin = QLabel("0.0 rad/s"); self.estimated_spin = QLabel("0.0 rad/s")
+        self.phase = QLabel("0.0 rad"); self.acceleration = QLabel("0.0, 0.0 m/s²")
+        self.wheels = QLabel("A 0.000 / B 0.000"); self.forces = QLabel("A 0.00 / B 0.00 N")
+        self.faults = QLabel("NONE"); self.faults.setObjectName("faults")
+        self.armed_status = QLabel("DISARMED")
+        hints = {
+            "Actual spin": "Physical truth from the plant.",
+            "Estimated spin": "Firmware estimate from the accelerometer: √(radial accel / sensor radius).",
+            "Estimated phase": "Firmware's integrated rotation angle; drives translation timing.",
+            "Measured acceleration": "Latest accelerometer sample delivered to firmware (sensor frame).",
+            "Motor demand": "Firmware throttle outputs, 0..1.",
+            "Applied wheel force": "Longitudinal tire force after the traction limit.",
+            "Runtime": "Firmware arming state.",
+            "Faults": "Active firmware safety faults.",
+        }
+        for label, widget in (("Actual spin", self.actual_spin), ("Estimated spin", self.estimated_spin),
+                              ("Estimated phase", self.phase), ("Measured acceleration", self.acceleration),
+                              ("Motor demand", self.wheels), ("Applied wheel force", self.forces),
+                              ("Runtime", self.armed_status), ("Faults", self.faults)):
+            name = QLabel(label); name.setToolTip(hints[label]); widget.setToolTip(hints[label])
+            grid.addRow(name, widget)
+        layout.addLayout(grid)
+        self.record_button = QPushButton("START RECORDING"); self.record_button.setCheckable(True)
+        self.record_button.setToolTip("Write this epoch's telemetry to CSV plus a JSON metadata file.")
+        self.record_button.toggled.connect(self._toggle_recording); layout.addWidget(self.record_button)
+        layout.addStretch()
+        return body
+
+    def _settings_dialog(self):
+        dialog = QDialog(self); dialog.setObjectName("settings_dialog")
+        dialog.setWindowTitle("Settings"); dialog.resize(600, 700)
+        layout = QVBoxLayout(dialog)
+        header = QHBoxLayout()
+        title = QLabel("SETTINGS"); title.setObjectName("section_title"); header.addWidget(title)
+        header.addStretch()
+        close = QPushButton("✕"); close.setObjectName("settings_close"); close.setFixedWidth(40)
+        close.setToolTip("Close settings (Esc). Unapplied edits are kept until you apply or restore.")
+        close.clicked.connect(dialog.close); header.addWidget(close)
+        self.settings_close_button = close
+        layout.addLayout(header)
         config_tabs = QTabWidget()
         config_tabs.addTab(self._field_page("physical", config_codec.PHYSICAL_FIELDS), "Physical robot")
         config_tabs.addTab(self._field_page("sensor", config_codec.SENSOR_FIELDS), "Physical sensor")
@@ -191,9 +317,22 @@ class MainWindow(QMainWindow):
         self.apply_button.clicked.connect(self._apply_editors); buttons.addWidget(self.apply_button)
         defaults = QPushButton("RESTORE DEFAULTS"); defaults.clicked.connect(self._restore_defaults); buttons.addWidget(defaults)
         layout.addLayout(buttons)
+        presets = QHBoxLayout()
+        load = QPushButton("LOAD PRESET…"); load.clicked.connect(self._load_preset); presets.addWidget(load)
+        save = QPushButton("SAVE PRESET…"); save.clicked.connect(self._save_preset); presets.addWidget(save)
+        layout.addLayout(presets)
         note = QLabel("Physical truth and firmware assumptions are independent. Structural changes validate atomically and reset simulation time.")
         note.setWordWrap(True); note.setObjectName("hint"); layout.addWidget(note)
-        return body
+        return dialog
+
+    def _show_settings(self):
+        self.settings_dialog.show(); self.settings_dialog.raise_(); self.settings_dialog.activateWindow()
+
+    def _dial_changed(self, angle_deg, strength):
+        self.direction_slider.blockSignals(True); self.direction_slider.setValue(round(angle_deg * 10))
+        self.direction_slider.blockSignals(False)
+        self.strength_slider.setValue(round(strength * 1000))
+        self._command_changed()
 
     def _field_page(self, prefix, fields):
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
@@ -205,24 +344,6 @@ class MainWindow(QMainWindow):
             form.addRow(LABELS.get(name, name), edit)
         scroll.setWidget(page)
         return scroll
-
-    def _telemetry_tab(self):
-        page = QWidget(); layout = QVBoxLayout(page)
-        self.telemetry = TelemetryPlot(); layout.addWidget(self.telemetry)
-        grid = QFormLayout()
-        self.actual_spin = QLabel("0.0 rad/s"); self.estimated_spin = QLabel("0.0 rad/s")
-        self.phase = QLabel("0.0 rad"); self.acceleration = QLabel("0.0, 0.0 m/s²")
-        self.wheels = QLabel("A 0.000 / B 0.000"); self.forces = QLabel("A 0.00 / B 0.00 N")
-        self.faults = QLabel("NONE"); self.faults.setObjectName("faults")
-        self.armed_status = QLabel("DISARMED")
-        for label, widget in (("Actual spin", self.actual_spin), ("Estimated spin", self.estimated_spin),
-                              ("Estimated phase", self.phase), ("Measured acceleration", self.acceleration),
-                              ("Motor demand", self.wheels), ("Applied wheel force", self.forces),
-                              ("Runtime", self.armed_status), ("Faults", self.faults)): grid.addRow(label, widget)
-        layout.addLayout(grid)
-        self.record_button = QPushButton("START RECORDING"); self.record_button.setCheckable(True)
-        self.record_button.toggled.connect(self._toggle_recording); layout.addWidget(self.record_button)
-        layout.addStretch(); return page
 
     def _menu(self):
         menu = self.menuBar().addMenu("Preset")
@@ -259,6 +380,7 @@ class MainWindow(QMainWindow):
 
     def _config_applied(self, config, state):
         self.config, self.initial_state = config, state
+        self.steering.reset()
         self._epoch_events.clear(); self._replace_epoch_spool()
         command = self._copy_command(reset_phase=False)
         command.arm = False
@@ -278,22 +400,116 @@ class MainWindow(QMainWindow):
         self.start_button.setText("❚❚  PAUSE" if running else "▶  START")
         self.start_button.blockSignals(False); self.step_button.setEnabled(not running)
         self.state_label.setText("SIM RUNNING" if running else "SIM PAUSED")
+        self._update_arm_button()
 
     def _reset(self):
         self.arm_button.setChecked(False); self.telemetry.clear(); self.reset_requested.emit()
 
     def _command_changed(self, *_):
+        self._send_command(force=True)
+
+    def _send_command(self, force):
+        """Build the RC command from the controls. The dial is world-aligned;
+        with steering on, its angle is rotated into the firmware's frame."""
         command = native.UserCommand()
-        command.spin = self.spin_slider.value() / 1000.0
+        requested_spin = self.spin_slider.value() / 1000.0
+        ceiling = self._spin_ceiling()
+        limited = self.spin_limit_check.isChecked() and requested_spin > ceiling
+        command.spin = ceiling if limited else requested_spin
         strength = self.strength_slider.value() / 1000.0
-        angle = math.radians(self.direction_slider.value() / 10.0)
-        command.translate_x = strength * math.cos(angle)
-        command.translate_y = strength * math.sin(angle)
+        desired = math.radians(self.direction_slider.value() / 10.0)
+        sent = self.steering.update(self.snapshot, self.config, desired, strength)
+        command.translate_x = strength * math.cos(sent)
+        command.translate_y = strength * math.sin(sent)
         command.arm = self.arm_button.isChecked()
+        previous = self.command
+        changed = force or any(abs(getattr(command, name) - getattr(previous, name)) > 2e-3
+                               for name in ("spin", "translate_x", "translate_y"))
+        self.arena.set_steering(self.steering.state)
+        if not changed:
+            return
         self.command = command
-        self.arm_button.setText("ARM REQUESTED" if command.arm else "DISARMED")
-        self.demand_label.setText(f"spin {command.spin:.3f} · translate {strength:.3f} @ {math.degrees(angle):+.1f}°")
+        self._update_arm_button()
+        target = command.spin * self.config.firmware.controller.maximum_spin_rad_s
+        if limited:
+            self.spin_value.setText(f"<span style='color:#ffd166'>{requested_spin:.0%} → capped {command.spin:.0%} "
+                                    f"({target:.0f} rad/s)</span>")
+        else:
+            self.spin_value.setText(f"{command.spin:.0%} → {target:.0f} rad/s")
+        frame = f" (firmware frame {math.degrees(sent):+.1f}°)" if self.steering.enabled and strength > 0 else ""
+        self.demand_label.setText(f"translate {strength:.0%} @ {math.degrees(desired):+.1f}° world{frame}")
+        self.direction_dial.set_value(math.degrees(desired), strength)
         self.command_requested.emit(command)
+
+    def _steering_toggled(self, enabled):
+        self.steering.enabled = enabled
+        self.steering.reset()
+        self._send_command(force=True)
+
+    def _speed_changed(self, value):
+        scale = 10 ** (value / 100.0)
+        self.speed_label.setText(f"{scale:.3f}×" if scale < 1 else f"{scale:.2f}×")
+        self.time_scale_requested.emit(scale)
+
+    def _update_arm_button(self):
+        firmware = self.snapshot.firmware if self.snapshot is not None else None
+        if not self.arm_button.isChecked():
+            text, tip = "DISARMED", "Press to arm. Spin demand must be at or below the arm limit."
+        elif firmware is not None and firmware.armed:
+            text, tip = "ARMED", "Firmware is armed and driving the motors."
+        elif firmware is not None and int(firmware.faults) & ~int(native.Fault.PHASE_INVALID):
+            text, tip = "ARM BLOCKED", "A safety fault is active; see Telemetry → Faults."
+        elif self.snapshot is not None and self.snapshot.time_us == 0:
+            # No frame consumed yet; the t = 0 frame is disarmed and low, so arming proceeds.
+            text, tip = "PRESS START", "The firmware arms once simulation time is running."
+        elif self.command.spin > self.config.firmware.arm_spin_max:
+            text, tip = "ARM BLOCKED", (
+                f"Arming requires spin demand ≤ {self.config.firmware.arm_spin_max:.0%}. "
+                "Lower spin, then toggle ARM off and on.")
+        elif not self.start_button.isChecked():
+            text, tip = "PRESS START", "The firmware arms once simulation time is running."
+        elif firmware is not None and not firmware.arm_interlock_satisfied:
+            text, tip = "ARM BLOCKED", (
+                "The firmware has not seen a disarmed low-spin frame. Lower spin, then toggle ARM off and on.")
+        else:
+            text, tip = "ARMING…", "Waiting for arm confirmation frames."
+        if self.arm_button.text() != text:
+            self.arm_button.setText(text)
+        self.arm_button.setToolTip(tip)
+        if firmware is not None and firmware.armed:
+            banner = None
+        elif not self.arm_button.isChecked():
+            banner = (f"MOTORS OFF · disarmed — set spin ≤ {self.config.firmware.arm_spin_max:.0%}, "
+                      "press ARM, then START")
+        else:
+            banner = "MOTORS OFF · " + (self._last_disarm + ". " if self._last_disarm else "") + tip
+        self.arena.set_banner(banner)
+
+    def _track_disarm(self, s, active):
+        """Latch why the firmware dropped out of ARMED; faults often clear before
+        anyone can read them (e.g. saturation stops once the robot slows)."""
+        if s.firmware.armed:
+            self._last_disarm = None
+        elif self._was_armed and self.arm_button.isChecked():
+            causes = [name for name in active if name != "PHASE INVALID"]
+            if not causes and s.sensed_acceleration.saturated:
+                causes = ["ACCELERATION SATURATED"]
+            reason = " · ".join(causes) if causes else "a transient fault"
+            self._last_disarm = f"Disarmed by {reason} at t = {s.time_us / 1e6:.2f} s"
+            if "ACCELERATION SATURATED" in causes:
+                self._last_disarm += (f" (spin {abs(s.spin_rad_s):.0f} rad/s exceeded the accelerometer's "
+                                      f"{self.config.sensor.max_acceleration_mps2:.0f} m/s² range)")
+            self.statusBar().showMessage(self._last_disarm, 10000)
+        elif not self.arm_button.isChecked():
+            self._last_disarm = None
+        self._was_armed = s.firmware.armed
+
+    def _spin_ceiling(self):
+        """Largest spin fraction whose radial acceleration stays within 90% of
+        the accelerometer range: the controller holds ā = ω*²·r_s."""
+        controller = self.config.firmware.controller
+        measurable = math.sqrt(self.config.sensor.max_acceleration_mps2 / controller.sensor_radius_m)
+        return min(1.0, SPIN_SENSOR_MARGIN * measurable / controller.maximum_spin_rad_s)
 
     def _zero_phase(self):
         self.phase_reset_requested.emit()
@@ -308,6 +524,8 @@ class MainWindow(QMainWindow):
     def _snapshot(self, s):
         self.snapshot = s; self._write_epoch_snapshot(s)
         self.arena.set_snapshot(s); self.telemetry.add_snapshot(s)
+        self.direction_dial.set_velocity(s.vx_mps, s.vy_mps)
+        self._send_command(force=False)  # keep the steering correction current
         self.time_label.setText(f"  t = {s.time_us / 1e6:.3f} s  ")
         self.actual_spin.setText(f"{s.spin_rad_s:+.2f} rad/s")
         self.estimated_spin.setText(f"{s.firmware.controller.spin_rad_s:+.2f} rad/s")
@@ -322,6 +540,8 @@ class MainWindow(QMainWindow):
         mask = int(s.firmware.faults); active = [name for name, fault in FAULTS if mask & int(fault)]
         self.faults.setText(" · ".join(active) if active else "NONE")
         self.faults.setProperty("active", bool(active)); self.faults.style().polish(self.faults)
+        self._track_disarm(s, active)
+        self._update_arm_button()
         if self.record_writer:
             self._write_record_snapshot(s)
 
@@ -334,6 +554,7 @@ class MainWindow(QMainWindow):
             self._finish_recording(final_snapshot)
 
     def _epoch_reset(self):
+        self.steering.reset()
         self._epoch_events.clear(); self._replace_epoch_spool()
         self.telemetry.clear(); self.arena.trail.clear()
 
@@ -488,6 +709,8 @@ QLineEdit { background:#0c131d; border:1px solid #2d4057; border-radius:3px; pad
 QTabWidget::pane { border:1px solid #26364a; } QTabBar::tab { padding:8px 12px; background:#172333; }
 QTabBar::tab:selected { background:#29435e; color:#76d5f7; } QLabel#section_title { color:#76d5f7; font-weight:700; letter-spacing:1px; }
 QLabel#hint { color:#7f91a8; } QLabel#faults[active="true"] { color:#ff718d; font-weight:700; }
+QScrollArea#math_overlay { background:rgba(14,21,32,240); border:1px solid #38516d; border-radius:6px; }
+QLabel#math_overlay_text { background:transparent; padding:10px; }
 QLabel#state_badge { color:#76d5f7; font-weight:700; padding-left:10px; } QMenuBar,QMenu { background:#111925; }
 """
 

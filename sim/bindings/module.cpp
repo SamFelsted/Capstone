@@ -165,7 +165,11 @@ PYBIND11_MODULE(melty_sim, m) {
       FIELD(Snapshot, sensed_acceleration)
       FIELD(Snapshot, firmware)
       FIELD(Snapshot, wheel_a)
-      FIELD(Snapshot, wheel_b);
+      FIELD(Snapshot, wheel_b)
+      FIELD(Snapshot, mean_drive_force_x_n)
+      FIELD(Snapshot, mean_drive_force_y_n)
+      FIELD(Snapshot, consumed_acceleration)
+      FIELD(Snapshot, consumed_command);
 
   py::class_<Simulator>(m, "Simulator")
       .def(py::init<const SimulationConfig&>(), py::arg("config") = SimulationConfig{})
