@@ -184,7 +184,12 @@ class Simulator::Impl {
     if (now_us == next_control_us) {
       enqueue_command(now_us);
       deliver_due();
+      const bool was_armed = runtime.status().armed;
       runtime.tick();
+      if (was_armed && !runtime.status().armed) {
+        last_disarm_us = now_us;
+        last_disarm_faults = runtime.status().faults;
+      }
       actuator_queue.push_back(
           {checked_add(now_us, config.actuator_latency_us),
            hal.motor_output()});
@@ -202,6 +207,8 @@ class Simulator::Impl {
     now_us = 0;
     hal.set_now(0);
     desired_command = {};
+    last_disarm_us = 0;
+    last_disarm_faults = Fault::none;
     sensor_queue.clear();
     command_queue.clear();
     actuator_queue.clear();
@@ -223,6 +230,8 @@ class Simulator::Impl {
   Micros next_sensor_us{0};
   Micros next_control_us{0};
   UserCommand desired_command{};
+  Micros last_disarm_us{0};
+  Fault last_disarm_faults{Fault::none};
   std::deque<Delayed<AccelerationSample>> sensor_queue;
   std::deque<Delayed<RcCommand>> command_queue;
   std::deque<Delayed<MotorOutput>> actuator_queue;
@@ -414,6 +423,8 @@ Snapshot Simulator::snapshot() const {
   result.firmware = impl_->runtime.status();
   result.consumed_acceleration = impl_->hal.last_read_acceleration();
   result.consumed_command = impl_->hal.last_read_rc();
+  result.last_disarm_us = impl_->last_disarm_us;
+  result.last_disarm_faults = impl_->last_disarm_faults;
   return result;
 }
 

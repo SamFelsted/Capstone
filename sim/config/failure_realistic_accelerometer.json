@@ -1,8 +1,12 @@
 {
   "schema": "meltybrain-simulator",
   "version": 1,
-  "title": "Default robot",
-  "description": "Ideal sensor matching firmware assumptions. Translation phase offset is uncalibrated, so use world-aligned steering.",
+  "title": "Failure: realistic accelerometer",
+  "description": "A real MEMS part: 2.5 m/s² noise, bias, a 1.2 mm mounting error and 1.7° of tilt on a ±200 g sensor. Firmware still assumes the ideal sensor, so its spin estimate reads ~2% high and its phase drifts ~45°/s. Arm, spin to 25% and push: the translation direction rotates and the robot circles instead of travelling. World-aligned steering is off; turn it on to see a driver (or heading beacon) cancel the drift.",
+  "ui": {
+    "world_aligned_steering": false,
+    "limit_spin_to_sensor": true
+  },
   "config": {
     "physical": {
       "mass_kg": 1.36,
@@ -15,7 +19,7 @@
       "motor_resistance_ohm": 0.35,
       "gear_ratio": 1.0,
       "drivetrain_efficiency": 0.85,
-      "motor_inertia_kg_m2": 0.000008,
+      "motor_inertia_kg_m2": 8e-06,
       "motor_current_limit_a": 30.0,
       "motor_time_constant_s": 0.025,
       "tire_friction_coefficient": 0.8,
@@ -25,14 +29,14 @@
       "battery_voltage": 8.4
     },
     "sensor": {
-      "radius_m": 0.025,
-      "angle_rad": 0.0,
-      "max_acceleration_mps2": 980.665,
-      "noise_stddev_mps2": 0.5,
-      "bias_x_mps2": 0.0,
-      "bias_y_mps2": 0.0,
+      "radius_m": 0.0262,
+      "angle_rad": 0.03,
+      "max_acceleration_mps2": 1961.33,
+      "noise_stddev_mps2": 2.5,
+      "bias_x_mps2": 1.5,
+      "bias_y_mps2": -1.0,
       "sample_period_us": 1000,
-      "latency_us": 500
+      "latency_us": 800
     },
     "firmware": {
       "control_period_us": 1000,

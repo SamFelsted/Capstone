@@ -14,6 +14,9 @@ from typing import Any
 SCHEMA = "meltybrain-simulator"
 VERSION = 1
 RECORDING_SCHEMA = "meltybrain-simulator-recording"
+# Optional presentation keys a preset may carry; they never reach the native config.
+METADATA_KEYS = ("title", "description", "ui")
+UI_SETTINGS = {"world_aligned_steering": bool, "limit_spin_to_sensor": bool}
 
 PHYSICAL_FIELDS = (
     "mass_kg", "body_radius_m", "moment_of_inertia_kg_m2", "wheel_radius_m",
@@ -127,7 +130,7 @@ def from_document(module: Any, document: dict[str, Any]) -> tuple[Any, Any]:
     root = _require_mapping(document, "preset")
     if root.get("schema") != SCHEMA or root.get("version") != VERSION:
         raise ValueError(f"unsupported preset schema/version (expected {SCHEMA} v{VERSION})")
-    allowed = {"schema", "version", "config", "initial_state"}
+    allowed = {"schema", "version", "config", "initial_state", *METADATA_KEYS}
     if set(root) - allowed:
         raise ValueError("unknown preset keys: " + ", ".join(sorted(set(root) - allowed)))
     raw_config = _require_mapping(root.get("config"), "config")
@@ -161,6 +164,31 @@ def from_document(module: Any, document: dict[str, Any]) -> tuple[Any, Any]:
     except (TypeError, OverflowError, ValueError, RuntimeError) as exc:
         raise ValueError(f"initial_state: {exc}") from exc
     return config, state
+
+
+def metadata(document: dict[str, Any]) -> dict[str, Any]:
+    """Title, description and UI settings of a preset, validated."""
+    root = _require_mapping(document, "preset")
+    result = {"title": root.get("title"), "description": root.get("description"), "ui": {}}
+    for key in ("title", "description"):
+        if result[key] is not None and not isinstance(result[key], str):
+            raise ValueError(f"{key} must be a string")
+    ui = _require_mapping(root.get("ui", {}), "ui")
+    unknown = set(ui) - set(UI_SETTINGS)
+    if unknown:
+        raise ValueError("unknown ui settings: " + ", ".join(sorted(unknown)))
+    for name, value in ui.items():
+        if not isinstance(value, UI_SETTINGS[name]):
+            raise ValueError(f"ui.{name} must be {UI_SETTINGS[name].__name__}")
+    result["ui"] = dict(ui)
+    return result
+
+
+def load_preset(module: Any, path: str | Path) -> tuple[Any, Any, dict[str, Any]]:
+    with Path(path).open("r", encoding="utf-8") as handle:
+        document = json.load(handle)
+    config, state = from_document(module, document)
+    return config, state, metadata(document)
 
 
 def load(module: Any, path: str | Path) -> tuple[Any, Any]:

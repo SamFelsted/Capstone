@@ -43,6 +43,7 @@ class SteeringState:
     motor_tau_s: float = 0.0
     spin_rad_s: float = 0.0
     trimming: bool = False
+    heading_at_tick_rad: float = 0.0
 
 
 class WorldSteering:
@@ -66,7 +67,11 @@ class WorldSteering:
                        + config.firmware.control_period_us) * 1e-6
             tau = config.physical.motor_time_constant_s
             state.spin_rad_s, state.latency_s, state.motor_tau_s = omega, latency, tau
-            state.drift_rad = wrap(snapshot.heading_rad - snapshot.firmware.controller.phase_rad)
+            # Compare at the same instant: the firmware phase is from its last
+            # control tick, so wind the true heading back to that tick.
+            since_tick = max(0, snapshot.time_us - snapshot.firmware.now_us) * 1e-6
+            state.heading_at_tick_rad = wrap(snapshot.heading_rad - omega * since_tick)
+            state.drift_rad = wrap(state.heading_at_tick_rad - snapshot.firmware.controller.phase_rad)
             state.lag_rad = math.copysign(math.atan(abs(omega) * tau) + abs(omega) * latency, omega)
             fx, fy = snapshot.mean_drive_force_x_n, snapshot.mean_drive_force_y_n
             state.push_n = math.hypot(fx, fy)

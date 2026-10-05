@@ -1,8 +1,12 @@
 {
   "schema": "meltybrain-simulator",
   "version": 1,
-  "title": "Default robot",
-  "description": "Ideal sensor matching firmware assumptions. Translation phase offset is uncalibrated, so use world-aligned steering.",
+  "title": "Failure: low-range accelerometer (±16 g)",
+  "description": "A ±16 g part (157 m/s²) at 25 mm saturates at ~79 rad/s. Firmware treats a saturated reading as a safety fault and disarms. The spin limiter is off here: arm, then raise spin past ~17% and the motors cut out (ACCELERATION SATURATED). Turn the limiter on to cap spin inside the sensor's range.",
+  "ui": {
+    "world_aligned_steering": true,
+    "limit_spin_to_sensor": false
+  },
   "config": {
     "physical": {
       "mass_kg": 1.36,
@@ -15,7 +19,7 @@
       "motor_resistance_ohm": 0.35,
       "gear_ratio": 1.0,
       "drivetrain_efficiency": 0.85,
-      "motor_inertia_kg_m2": 0.000008,
+      "motor_inertia_kg_m2": 8e-06,
       "motor_current_limit_a": 30.0,
       "motor_time_constant_s": 0.025,
       "tire_friction_coefficient": 0.8,
@@ -27,7 +31,7 @@
     "sensor": {
       "radius_m": 0.025,
       "angle_rad": 0.0,
-      "max_acceleration_mps2": 980.665,
+      "max_acceleration_mps2": 156.9,
       "noise_stddev_mps2": 0.5,
       "bias_x_mps2": 0.0,
       "bias_y_mps2": 0.0,

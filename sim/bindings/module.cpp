@@ -169,7 +169,9 @@ PYBIND11_MODULE(melty_sim, m) {
       FIELD(Snapshot, mean_drive_force_x_n)
       FIELD(Snapshot, mean_drive_force_y_n)
       FIELD(Snapshot, consumed_acceleration)
-      FIELD(Snapshot, consumed_command);
+      FIELD(Snapshot, consumed_command)
+      FIELD(Snapshot, last_disarm_us)
+      FIELD(Snapshot, last_disarm_faults);
 
   py::class_<Simulator>(m, "Simulator")
       .def(py::init<const SimulationConfig&>(), py::arg("config") = SimulationConfig{})

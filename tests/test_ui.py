@@ -304,6 +304,7 @@ def test_vector_derivations_match_native_values():
         for key in vector_math.VECTORS:
             derivation = vector_math.derive(key, snapshot, config)
             assert vector_math.to_html(derivation)
+            assert all(section.why for section in derivation.sections), (key, [s.title for s in derivation.sections])
             for check in derivation.checks:
                 assert check.ok, (key, check.name, check.recomputed, check.reported)
                 checked += 1
@@ -389,4 +390,63 @@ def test_spin_limiter_keeps_motors_on_and_disarm_reason_is_latched(app):
     assert not window.snapshot.firmware.armed
     assert "ACCELERATION SATURATED" in (window._last_disarm or "")
     assert window.arena.banner and "ACCELERATION SATURATED" in window.arena.banner
+    assert window.close()
+
+
+def test_builtin_presets_load_from_menu_with_ui_settings(app):
+    from sim.ui.main import PRESET_DIR
+    window = MainWindow(); spin_events(app, 100)
+    titles = [action.text() for action in window.presets_button.menu().actions() if action.text()]
+    assert "Failure: realistic accelerometer" in titles and "Default robot" in titles
+    for path in sorted(PRESET_DIR.glob("*.json")):
+        meta = config_codec.metadata(json.loads(path.read_text()))
+        window._apply_preset_file(path); spin_events(app, 80)
+        assert not window.preset_label.isHidden() and meta["title"] in window.preset_label.text()
+        assert window.steering_check.isChecked() == meta["ui"].get("world_aligned_steering", True)
+        assert window.spin_limit_check.isChecked() == meta["ui"].get("limit_spin_to_sensor", True)
+    assert window.close()
+
+
+def test_low_range_preset_disarms_with_latched_saturation(app):
+    from sim.ui.main import PRESET_DIR
+    window = MainWindow(); window.show(); spin_events(app, 100)
+    window._apply_preset_file(PRESET_DIR / "failure_low_range_accelerometer.json"); spin_events(app, 150)
+    window.arm_button.setChecked(True); window.start_button.click(); spin_events(app, 150)
+    window.spin_slider.setValue(300); spin_events(app, 2500)
+    assert not window.snapshot.firmware.armed
+    assert "ACCELERATION SATURATED" in (window._last_disarm or "")
+    assert window.close()
+
+
+def test_steady_steering_does_not_flood_command_events(app):
+    window = MainWindow(); window.show(); spin_events(app, 100)
+    window.arm_button.setChecked(True); window.start_button.click(); spin_events(app, 100)
+    window.spin_slider.setValue(250); window._dial_changed(30.0, 0.8); spin_events(app, 2500)
+    before = len(window._epoch_events)
+    spin_events(app, 3000)
+    assert len(window._epoch_events) - before < 30  # ~1/s steady; was ~21/s
+    assert window.close()
+
+
+def test_flowchart_mode_shows_live_blocks_and_opens_math(app):
+    from PySide6.QtCore import QPointF
+    window = MainWindow(); window.show(); spin_events(app, 100)
+    window.arm_button.setChecked(True); window.start_button.click(); spin_events(app, 100)
+    window.spin_slider.setValue(250); spin_events(app, 600)
+    window.mode_buttons.button(1).click(); spin_events(app, 100)
+    assert window.telemetry_stack.currentWidget() is window.flow_diagram
+    window.flow_diagram.repaint()
+    diagram = window.flow_diagram
+    assert {"mixer", "tires", "chassis", "accelerometer"} <= set(diagram._rects)
+    mixer_lines = diagram._lines("mixer")
+    assert mixer_lines[0] == f"u_A = {window.snapshot.firmware.output.wheel_a:.3f}"
+    received = []
+    diagram.block_clicked.connect(received.append)
+    tires = diagram._rects["tires"].center()
+    assert diagram._block_at(QPointF(tires)) == "tires"
+    window._open_vector("net_force"); spin_events(app, 50)
+    assert window.arena.selected == "net_force"
+    window.mode_buttons.button(0).click()
+    assert window.telemetry_stack.currentIndex() == 0
+    assert window.presets_button.menu() is not None
     assert window.close()

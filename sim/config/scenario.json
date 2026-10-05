@@ -1,6 +1,8 @@
 {
   "schema": "meltybrain-simulator",
   "version": 1,
+  "title": "Calibrated translation demo",
+  "description": "Single-speed calibrated demo: arm at zero spin, then command 25% spin and a +X push. The 2.15 rad phase offset was tuned near 112 rad/s.",
   "config": {
     "physical": {
       "mass_kg": 1.36, "body_radius_m": 0.09, "moment_of_inertia_kg_m2": 0.0055,

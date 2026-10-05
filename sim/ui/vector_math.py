@@ -20,7 +20,7 @@ TITLES = {
 }
 
 COLORS = {
-    "wheel_a": "#f5a44c",
+    "wheel_a": "#c792ea",
     "wheel_b": "#8bd17c",
     "net_force": "#ef5da8",
     "velocity": "#76d5f7",
@@ -45,6 +45,7 @@ class Section:
     steps: list[Step] = field(default_factory=list)
     note: str = ""
     inputs: list[tuple[str, str, str]] = field(default_factory=list)  # (symbol, value, source)
+    why: str = ""
 
 
 SETTINGS = "⚙ "  # names the Settings tab and field the value comes from
@@ -112,16 +113,71 @@ def summary(key, s, cfg, steering=None):
             "Click for the live derivation.")
 
 
+# The intuition behind each section, keyed by (vector, section title). Kept in
+# one place so the explanations read as a single story.
+WHY = {
+    ("wheel", "Inputs"):
+        "This is everything the firmware has to go on: one accelerometer reading, your radio command, two "
+        "remembered values and its settings. It never sees the robot's true heading.",
+    ("wheel", "How fast is it spinning?"):
+        "A meltybrain has no encoder or compass. Spinning presses the accelerometer outward (a = ω²r), so "
+        "measuring that push tells the firmware its speed, and adding speed up over time tells it which way it faces.",
+    ("wheel", "Throttle to hold spin (c)"):
+        "The weapon is the spin, so speed must be held steady. Both wheels get the same base throttle: their "
+        "forces turn the robot and cancel out as a net push.",
+    ("wheel", "Push toward the dial (m)"):
+        "A spinning robot can't point and drive. Instead it briefly speeds wheel A up whenever wheel A faces your "
+        "direction and slows it on the far side of the turn, so the extra force piles up one way each revolution. "
+        "That's why the heading estimate φ̂ matters: a wrong angle pushes the wrong way.",
+    ("wheel", "Wheel A output"):
+        "c keeps it spinning, m steers it. Wheel B gets c − m because it sits opposite wheel A, so the same timing "
+        "pushes in the same world direction.",
+    ("wheel", "Wheel B output"):
+        "c keeps it spinning, m steers it. Wheel B gets c − m because it sits opposite wheel A, so the same timing "
+        "pushes in the same world direction.",
+    ("net_force", "Inputs"):
+        "Motors don't push the robot directly; the tires do, through grip on the floor.",
+    ("net_force", "Wheel A contact"):
+        "A tire only pushes when its surface moves at a different speed than the floor under it (slip). More slip "
+        "means more force, until the tire runs out of grip (μ·N) and slides.",
+    ("net_force", "Wheel B contact"):
+        "Same tire model as wheel A. Wheel B faces the opposite way, so its force points along body −Y.",
+    ("net_force", "Combine on chassis"):
+        "Equal wheel forces only spin the robot. The difference F_A − F_B is what's left to push it across the "
+        "floor, and it is the arrow you steer with.",
+    ("velocity", "Inputs"):
+        "Velocity is the end result of everything above: push accumulated over time, minus drag.",
+    ("velocity", "Derivation"):
+        "Each tick, force nudges velocity (F = m·a). Drag grows with speed, so under a steady push the robot "
+        "settles at the speed where drive force equals drag.",
+    ("steering", "Inputs"):
+        "The dial is in world coordinates, but the firmware steers in its own rotating frame. Converting between "
+        "them means knowing how far off that frame is.",
+    ("steering", "World → firmware frame"):
+        "Two errors separate where the firmware thinks it pushes from where the robot really pushes: its heading "
+        "estimate drifts (δ), and the motors respond late (λ), so the push lands after the robot has turned further. "
+        "Subtracting both makes the push land where you aim.",
+    ("steering", "Measured result"):
+        "Checking the real push closes the loop: whatever the model missed shows up as an error, and the trim "
+        "slowly removes it.",
+}
+
+
 def derive(key, s, cfg, steering=None):
     if key == "steering":
-        return _steering(s, cfg, steering)
-    if key in ("wheel_a", "wheel_b"):
-        return _wheel_command(key, s, cfg)
-    if key == "net_force":
-        return _net_force(s, cfg)
-    if key == "velocity":
-        return _velocity(s, cfg)
-    raise KeyError(key)
+        derivation = _steering(s, cfg, steering)
+    elif key in ("wheel_a", "wheel_b"):
+        derivation = _wheel_command(key, s, cfg)
+    elif key == "net_force":
+        derivation = _net_force(s, cfg)
+    elif key == "velocity":
+        derivation = _velocity(s, cfg)
+    else:
+        raise KeyError(key)
+    group = "wheel" if key in ("wheel_a", "wheel_b") else key
+    for section in derivation.sections:
+        section.why = section.why or WHY.get((group, section.title), "")
+    return derivation
 
 
 def _wheel_command(key, s, cfg):
@@ -131,69 +187,51 @@ def _wheel_command(key, s, cfg):
     cmd = s.consumed_command
     sign = 1 if key == "wheel_a" else -1
     letter = "A" if key == "wheel_a" else "B"
+    op = "+" if sign > 0 else "−"
     dt = cfg.firmware.control_period_us * 1e-6
     checks = []
 
-    # 1. Spin estimate from the accelerometer, exactly as Controller::update.
+    # Spin estimate, exactly as Controller::update computes it.
     cos_s, sin_s = math.cos(c.sensor_angle_rad), math.sin(c.sensor_angle_rad)
     body_x = cos_s * acc.x_mps2 - sin_s * acc.y_mps2
     measured = max(0.0, -body_x)
     alpha = 1.0 - math.exp(-2.0 * math.pi * c.radial_accel_filter_hz * dt)
     radial = t.radial_accel_mps2
     omega = math.sqrt(max(0.0, radial / c.sensor_radius_m))
-    spin_est = c.spin_direction * omega
-    checks.append(Check("estimated spin ω̂", spin_est, t.spin_rad_s))
+    checks.append(Check("estimated spin ω̂", c.spin_direction * omega, t.spin_rad_s))
     phase_valid = radial >= c.radial_accel_floor_mps2 and omega >= c.minimum_phase_spin_rad_s
-    fa = SETTINGS + "Firmware assumptions › "
-    inputs = Section("1 · Inputs", inputs=[
-        ("a<sub>x</sub>, a<sub>y</sub>", f"{acc.x_mps2:+.2f}, {acc.y_mps2:+.2f} m/s²",
-         f"accelerometer sample firmware read (sensor frame), stamped t = {acc.timestamp_us / 1e3:.3f} ms; "
-         "modelled from the true motion, sensor placement, noise and latency in " + SETTINGS + "Physical sensor"),
-        ("θ<sub>s</sub>", f"{c.sensor_angle_rad:g} rad", fa + "Assumed sensor angle"),
-        ("r<sub>s</sub>", f"{c.sensor_radius_m:g} m", fa + "Assumed sensor radius"),
-        ("f", f"{c.radial_accel_filter_hz:g} Hz", fa + "Accel filter"),
-        ("Δt", f"{dt * 1e3:g} ms", SETTINGS + "Firmware runtime › Control period"),
-        ("floor, min", f"{c.radial_accel_floor_mps2:g} m/s², {c.minimum_phase_spin_rad_s:g} rad/s",
-         fa + "Radial accel floor, Min phase spin"),
-        ("spin", f"{cmd.spin:.3f}", f"RC frame firmware read, stamped t = {cmd.timestamp_us / 1e3:.3f} ms ← Spin demand slider "
-         "(arrives after " + SETTINGS + "Simulation › Receiver latency)"),
-        ("T<sub>x</sub>, T<sub>y</sub>", f"{cmd.translate_x:+.3f}, {cmd.translate_y:+.3f}", "same RC frame ← direction dial"),
-        ("ω<sub>max</sub>", f"{c.maximum_spin_rad_s:g} rad/s", fa + "Maximum spin"),
-        ("K<sub>p</sub>, K<sub>i</sub>", f"{c.spin_kp:g}, {c.spin_ki:g}", fa + "Spin Kp, Spin Ki"),
-        ("I limit", f"±{c.spin_integrator_limit:g}", fa + "Integrator limit"),
-        ("headroom", f"{c.command_headroom:g}", fa + "Command headroom"),
-        ("I", _f(t.spin_integrator), "firmware state: integrator carried between ticks"),
-        ("φ̂", _deg(t.phase_rad), "firmware state: φ̂ += ω̂·Δt each tick; ZERO PHASE resets it"),
-        ("dir", f"{c.spin_direction:+d}", fa + "Spin direction"),
-        ("gain", f"{c.translation_gain:g}", fa + "Translation gain"),
-        ("offset", _deg(c.translation_phase_offset_rad), fa + "Translation phase offset"),
-        ("armed", "yes" if s.firmware.armed else "no", "firmware runtime ← ARM button, after the arm interlock"),
+    receiver_ms = cfg.command_latency_us / 1e3
+
+    fa = SETTINGS + "Firmware assumptions"
+    inputs = Section("Inputs", inputs=[
+        ("a<sub>x</sub>, a<sub>y</sub>", f"{acc.x_mps2:+.1f}, {acc.y_mps2:+.1f} m/s²",
+         "accelerometer"),
+        ("spin", f"{cmd.spin:.0%}", f"spin slider (+{receiver_ms:g} ms radio)"),
+        ("T", f"({cmd.translate_x:+.2f}, {cmd.translate_y:+.2f})", f"direction dial (+{receiver_ms:g} ms radio)"),
+        ("I", _f(t.spin_integrator, 3), "firmware memory (integrator)"),
+        ("φ̂", _deg(t.phase_rad), "firmware memory (rotation angle)"),
+        ("sensor", f"r<sub>s</sub> {c.sensor_radius_m:g} m · θ<sub>s</sub> {c.sensor_angle_rad:g} · {c.radial_accel_filter_hz:g} Hz", fa),
+        ("spin loop", f"ω<sub>max</sub> {c.maximum_spin_rad_s:g} · K<sub>p</sub> {c.spin_kp:g} · K<sub>i</sub> {c.spin_ki:g}", fa),
+        ("steering", f"gain {c.translation_gain:g} · offset {_deg(c.translation_phase_offset_rad)}", fa),
     ])
-    estimate = Section("2 · Spin estimate (accelerometer → ω̂)", [
-        Step("body-X accel", "a<sub>x,body</sub> = cos θ<sub>s</sub>·a<sub>x</sub> − sin θ<sub>s</sub>·a<sub>y</sub>",
-             f"cos({c.sensor_angle_rad:.3f})·{_f(acc.x_mps2, 2)} − sin({c.sensor_angle_rad:.3f})·{_f(acc.y_mps2, 2)}",
-             f"{_f(body_x, 2)} m/s²"),
-        Step("measured radial", "a<sub>r</sub> = max(0, −a<sub>x,body</sub>)",
-             f"max(0, {_f(-body_x, 2)})", f"{measured:.2f} m/s²"),
-        Step("low-pass filter", "ā<sub>r</sub> += α·(a<sub>r</sub> − ā<sub>r</sub>),  α = 1 − e<sup>−2π·f·Δt</sup>",
-             f"α = 1 − e<sup>−2π·{c.radial_accel_filter_hz:g}·{dt:g}</sup> = {alpha:.4f}",
-             f"ā<sub>r</sub> = {radial:.2f} m/s²", lead="where "),
-        Step("spin magnitude", "|ω̂| = √(ā<sub>r</sub> / r<sub>s</sub>)",
-             f"√({radial:.2f} / {c.sensor_radius_m:g})", f"{omega:.2f} rad/s"),
-        Step("phase valid?", "ā<sub>r</sub> ≥ floor  and  |ω̂| ≥ min",
-             f"{radial:.1f} ≥ {c.radial_accel_floor_mps2:g}  and  {omega:.1f} ≥ {c.minimum_phase_spin_rad_s:g}",
-             "yes" if phase_valid else "no — translation off"),
-    ], note=f"Sample used: accelerometer reading stamped t = {acc.timestamp_us / 1e3:.3f} ms; "
-            f"physical truth is {s.spin_rad_s:+.2f} rad/s.")
+    estimate = Section("How fast is it spinning?", [
+        Step("radial accel", "a<sub>r</sub> = −(cos θ<sub>s</sub>·a<sub>x</sub> − sin θ<sub>s</sub>·a<sub>y</sub>)",
+             f"−(cos {c.sensor_angle_rad:g}·{acc.x_mps2:+.1f} − sin {c.sensor_angle_rad:g}·{acc.y_mps2:+.1f})",
+             f"{measured:.1f} m/s²"),
+        Step("smoothed", "ā<sub>r</sub> moves α of the way toward a<sub>r</sub> each tick",
+             f"α = 1 − e<sup>−2π·{c.radial_accel_filter_hz:g} Hz·{dt * 1e3:g} ms</sup> = {alpha:.3f}",
+             f"ā<sub>r</sub> = {radial:.1f} m/s²", lead="with "),
+        Step("spin", "|ω̂| = √(ā<sub>r</sub> / r<sub>s</sub>)", f"√({radial:.1f} / {c.sensor_radius_m:g})",
+             f"<b>{omega:.1f} rad/s</b>"),
+        Step("can steer?", f"needs ā<sub>r</sub> ≥ {c.radial_accel_floor_mps2:g} m/s² and |ω̂| ≥ {c.minimum_phase_spin_rad_s:g} rad/s",
+             f"{radial:.0f} m/s², {omega:.0f} rad/s", "yes" if phase_valid else "no, so no push this tick", lead=""),
+    ], note=f"Actual spin is {abs(s.spin_rad_s):.1f} rad/s; the estimate only sees the accelerometer.")
 
     if not s.firmware.armed:
-        output = getattr(s.firmware.output, key)
-        checks.append(Check(f"wheel {letter} output", 0.0, output))
-        return Derivation(key, TITLES[key], "Firmware is disarmed, so both motor outputs are forced to 0.",
-                          [inputs, estimate, Section("3 · Output", [Step("disarmed", "u = 0", "runtime not armed", "0.000")])],
-                          checks)
+        checks.append(Check(f"wheel {letter} output", 0.0, getattr(s.firmware.output, key)))
+        return Derivation(key, TITLES[key], "Firmware is disarmed, so both wheels are held at 0.",
+                          [inputs, estimate], checks)
 
-    # 2. Spin PI controller → common throttle.
     target = cmd.spin * c.maximum_spin_rad_s
     error = target - omega
     checks.append(Check("spin error e", error, t.spin_error_rad_s))
@@ -201,53 +239,51 @@ def _wheel_command(key, s, cfg):
     integrator = t.spin_integrator
     max_common = 1.0 - c.command_headroom
     common = _clamp(proportional + integrator, 0.0, max_common)
-    checks.append(Check("common term", common, t.common_command))
-    spin_section = Section("3 · Spin controller (PI → common throttle)", [
-        Step("target spin", "ω* = spin·ω<sub>max</sub>", f"{cmd.spin:.3f}·{c.maximum_spin_rad_s:g}", f"{target:.2f} rad/s"),
-        Step("error", "e = ω* − |ω̂|", f"{target:.2f} − {omega:.2f}", f"{error:+.2f} rad/s"),
-        Step("proportional", "P = K<sub>p</sub>·e", f"{c.spin_kp:g}·{error:+.2f}", _f(proportional)),
-        Step("integral", "I += K<sub>i</sub>·e·Δt  (clamped ±limit, anti-windup)",
-             f"limit ±{c.spin_integrator_limit:g}; firmware state", _f(integrator), lead="with "),
-        Step("common", "c = clamp(P + I, 0, 1 − headroom)",
-             f"clamp({_f(proportional)} + {_f(integrator)}, 0, {max_common:g})", f"{common:.4f}"),
-    ])
+    checks.append(Check("common throttle c", common, t.common_command))
+    spin_section = Section("Throttle to hold spin (c)", [
+        Step("target", "ω* = spin × ω<sub>max</sub>", f"{cmd.spin:.3f} × {c.maximum_spin_rad_s:g}", f"{target:.1f} rad/s"),
+        Step("error", "e = ω* − |ω̂|", f"{target:.1f} − {omega:.1f}", f"{error:+.2f} rad/s"),
+        Step("throttle", f"c = K<sub>p</sub>·e + I, kept within 0…{max_common:g}",
+             f"{c.spin_kp:g} × {error:+.2f} + {integrator:.3f}", f"<b>{common:.3f}</b>"),
+    ], note="The integrator I builds up slowly to remove any steady speed error.")
 
-    # 3. Translation modulation.
     magnitude = min(1.0, math.hypot(cmd.translate_x, cmd.translate_y))
     desired = math.atan2(cmd.translate_y, cmd.translate_x)
     phase = t.phase_rad
     force_angle = phase + c.spin_direction * 0.5 * math.pi + c.translation_phase_offset_rad
-    requested = c.translation_gain * magnitude * math.cos(force_angle - desired)
+    alignment = math.cos(force_angle - desired)
+    requested = c.translation_gain * magnitude * alignment
     available = min(common, 1.0 - common)
     modulating = phase_valid and magnitude > 0.0
     modulation = _clamp(requested, -available, available) if modulating else 0.0
-    checks.append(Check("modulation m", modulation, t.modulation_command))
-    translate_section = Section("4 · Translation (phase-locked modulation)", [
-        Step("demand", "|T| = min(1, √(T<sub>x</sub>² + T<sub>y</sub>²)),  ψ = atan2(T<sub>y</sub>, T<sub>x</sub>)",
-             f"T = ({cmd.translate_x:+.3f}, {cmd.translate_y:+.3f})", f"|T| = {magnitude:.3f}, ψ = {_deg(desired)}"),
-        Step("wheel A force angle", "φ<sub>A</sub> = φ̂ + dir·π/2 + offset",
-             f"{_deg(phase)} + {c.spin_direction:+d}·90° + {_deg(c.translation_phase_offset_rad)}",
-             _deg(_wrap(force_angle))),
-        Step("requested", "m* = gain·|T|·cos(φ<sub>A</sub> − ψ)",
-             f"{c.translation_gain:g}·{magnitude:.3f}·cos({_deg(_wrap(force_angle - desired))})", _f(requested)),
-        Step("available", "room = min(c, 1 − c)", f"min({common:.4f}, {1 - common:.4f})", f"{available:.4f}"),
-        Step("modulation", "m = clamp(m*, −room, room)" if modulating else "m = 0  (phase invalid or no demand)",
-             f"clamp({_f(requested)}, ±{available:.4f})" if modulating else "—", _f(modulation)),
-    ], note=f"Firmware phase φ̂ = {_deg(phase)}; true heading = {_deg(s.heading_rad)}. "
-            f"RC frame stamped t = {cmd.timestamp_us / 1e3:.3f} ms (receiver latency).")
+    checks.append(Check("push m", modulation, t.modulation_command))
+    if not modulating:
+        push_steps = [Step("push", "m = 0", "no direction demand" if magnitude == 0 else "spin too slow to know the heading",
+                           "0.000", lead="")]
+    else:
+        clipped = abs(requested) > available
+        push_steps = [
+            Step("wheel A faces", "φ<sub>A</sub> = φ̂ + 90° + offset",
+                 f"{_deg(phase)} + {c.spin_direction * 90:+d}° + {_deg(c.translation_phase_offset_rad)}", _deg(_wrap(force_angle))),
+            Step("lined up?", "cos(φ<sub>A</sub> − ψ)",
+                 f"cos({_deg(_wrap(force_angle))} − {_deg(desired)})", f"{alignment:+.2f}"),
+            Step("push", "m = gain × |T| × cos(…)" + (", capped at ±min(c, 1 − c)" if clipped else ""),
+                 f"{c.translation_gain:g} × {magnitude:.2f} × {alignment:+.2f}" + (f" → cap ±{available:.3f}" if clipped else ""),
+                 f"<b>{modulation:+.3f}</b>"),
+        ]
+    translate_section = Section("Push toward the dial (m)", push_steps,
+                                note="m is positive when wheel A faces the dial direction, so wheel A speeds up and wheel B "
+                                     "slows down; half a turn later the signs swap. Averaged over a turn that is a net push.")
 
-    raw = common + sign * modulation
-    output = _clamp(raw, 0.0, 1.0)
-    reported = getattr(s.firmware.output, key)
-    checks.append(Check(f"wheel {letter} output", output, reported))
-    op = "+" if sign > 0 else "−"
-    output_section = Section("5 · Wheel output", [
-        Step(f"wheel {letter}", f"u<sub>{letter}</sub> = clamp(c {op} m, 0, 1)",
-             f"clamp({common:.4f} {op} {abs(modulation):.4f}, 0, 1)", f"<b>{output:.4f}</b>"),
+    output = _clamp(common + sign * modulation, 0.0, 1.0)
+    checks.append(Check(f"wheel {letter} output", output, getattr(s.firmware.output, key)))
+    output_section = Section(f"Wheel {letter} output", [
+        Step(f"u<sub>{letter}</sub>", f"c {op} m, kept within 0…1",
+             f"{common:.3f} {op} {abs(modulation):.3f}", f"<b>{output:.3f}</b>"),
     ])
     return Derivation(key, TITLES[key],
-                      f"Firmware tick t = {s.firmware.last_tick_us / 1e3:.3f} ms · draws along body "
-                      f"{'+' if sign > 0 else '−'}Y at wheel {letter}",
+                      f"u<sub>{letter}</sub> = c {op} m = <b>{output:.3f}</b>: throttle to hold spin {op} a push timed to the "
+                      f"rotation · firmware tick t = {s.firmware.last_tick_us / 1e3:.1f} ms",
                       [inputs, estimate, spin_section, translate_section, output_section], checks)
 
 
@@ -278,7 +314,7 @@ def _net_force(s, cfg):
     world_angle = s.heading_rad + math.pi / 2
     fx, fy = net * math.cos(world_angle), net * math.sin(world_angle)
     pr = SETTINGS + "Physical robot › "
-    inputs = Section("1 · Inputs", inputs=[
+    inputs = Section("Inputs", inputs=[
         ("ω<sub>w,A</sub>, ω<sub>w,B</sub>", f"{s.wheel_a.wheel_speed_rad_s:.2f}, {s.wheel_b.wheel_speed_rad_s:.2f} rad/s",
          "plant motor state, driven by the wheel commands (motor Kt, Ke, resistance, battery, current limit)"),
         ("v<sub>ground</sub>", "per wheel", "chassis velocity + spin × wheel offset, along each wheel's rolling direction"),
@@ -289,7 +325,7 @@ def _net_force(s, cfg):
         ("d", f"{p.wheel_offset_m:g} m", pr + "Wheel offset"),
         ("θ", _deg(s.heading_rad), "plant state: true heading"),
     ])
-    combine = Section("4 · Combine on chassis", [
+    combine = Section("Combine on chassis", [
         Step("net along body Y", "F<sub>y</sub> = F<sub>A</sub> − F<sub>B</sub>  (B drives along −Y)",
              f"{s.wheel_a.applied_force_n:+.4f} − ({s.wheel_b.applied_force_n:+.4f})", f"<b>{net:+.4f} N</b>"),
         Step("in world frame", "F<sub>world</sub> = F<sub>y</sub>·(cos(θ+90°), sin(θ+90°))",
@@ -299,7 +335,7 @@ def _net_force(s, cfg):
     ], note="Lateral (sideways) tire scrub forces also act but are not drawn by this arrow.")
     return Derivation("net_force", TITLES["net_force"],
                       f"Plant contact model at t = {s.time_us / 1e3:.3f} ms · drawn from the chassis centre",
-                      [inputs, Section("2 · Wheel A contact", steps_a), Section("3 · Wheel B contact", steps_b), combine],
+                      [inputs, Section("Wheel A contact", steps_a), Section("Wheel B contact", steps_b), combine],
                       [check_a, check_b])
 
 
@@ -323,14 +359,14 @@ def _velocity(s, cfg):
              "—" if math.isinf(revolution) else f"{revolution * 1000:.3f} mm"),
     ]
     return Derivation("velocity", TITLES["velocity"], f"Physical truth at t = {s.time_us / 1e3:.3f} ms",
-                      [Section("1 · Inputs", inputs=[
+                      [Section("Inputs", inputs=[
                           ("v<sub>x</sub>, v<sub>y</sub>", f"{s.vx_mps:+.5f}, {s.vy_mps:+.5f} m/s",
                            "plant state, integrated each physics tick from tire forces and drag"),
                           ("θ, ω", f"{_deg(s.heading_rad)}, {s.spin_rad_s:+.2f} rad/s", "plant state: true heading and spin"),
                           ("m", f"{p.mass_kg:g} kg", SETTINGS + "Physical robot › Mass"),
                           ("c<sub>d</sub>", f"{p.linear_drag_n_per_mps:g} N/(m/s)", SETTINGS + "Physical robot › Linear drag"),
                           ("Δt", f"{cfg.physics_tick_us} µs", SETTINGS + "Simulation › Physics tick"),
-                      ]), Section("2 · Derivation", steps)], [])
+                      ]), Section("Derivation", steps)], [])
 
 
 def _steering(s, cfg, st):
@@ -339,7 +375,7 @@ def _steering(s, cfg, st):
     w = abs(st.spin_rad_s)
     motor_lag = math.atan(w * st.motor_tau_s)
     delay_lag = w * st.latency_s
-    inputs = Section("1 · Inputs", inputs=[
+    inputs = Section("Inputs", inputs=[
         ("ψ<sub>world</sub>, |T|", f"{_deg(st.desired_rad)}, {st.strength:.0%}", "direction dial (world frame: 0° = +X, 90° = +Y)"),
         ("θ", _deg(s.heading_rad), "plant truth: the robot's real heading (what a driver sees)"),
         ("φ̂", _deg(s.firmware.controller.phase_rad), "firmware state: its estimated phase"),
@@ -354,7 +390,9 @@ def _steering(s, cfg, st):
         steps = [Step("sent", "ψ<sub>fw</sub> = ψ<sub>world</sub>", "world-aligned steering is off", _deg(st.sent_rad))]
     else:
         steps = [
-            Step("phase drift", "δ = wrap(θ − φ̂)", f"{_deg(s.heading_rad)} − {_deg(s.firmware.controller.phase_rad)}", _deg(st.drift_rad)),
+            Step("heading at tick", "θ<sub>tick</sub> = θ − ω·(t − t<sub>tick</sub>)",
+                 f"{_deg(s.heading_rad)} − {s.spin_rad_s:.1f}·{max(0, s.time_us - s.firmware.now_us) * 1e-6:g} s", _deg(st.heading_at_tick_rad)),
+            Step("phase drift", "δ = wrap(θ<sub>tick</sub> − φ̂)", f"{_deg(st.heading_at_tick_rad)} − {_deg(s.firmware.controller.phase_rad)}", _deg(st.drift_rad)),
             Step("motor lag", "λ<sub>m</sub> = atan(|ω|·τ<sub>m</sub>)", f"atan({w:.1f}·{st.motor_tau_s:g})", _deg(motor_lag)),
             Step("delay lag", "λ<sub>d</sub> = |ω|·t<sub>delay</sub>", f"{w:.1f}·{st.latency_s:g}", _deg(delay_lag)),
             Step("trim", "τ̂ += k·(ψ<sub>world</sub> − push)·Δt", f"k = 1.5/s, " + ("updating" if st.trimming else "held (needs armed, valid phase, demand, push)"), _deg(st.trim_rad)),
@@ -369,8 +407,8 @@ def _steering(s, cfg, st):
         ]
     return Derivation("steering", TITLES["steering"],
                       "Yellow ghost = your world demand on the robot · dotted = measured push",
-                      [inputs, Section("2 · World → firmware frame", steps),
-                       Section("3 · Measured result", measured or [Step("push", "—", "no measurable push yet", "—", lead="")],
+                      [inputs, Section("World → firmware frame", steps),
+                       Section("Measured result", measured or [Step("push", "—", "no measurable push yet", "—", lead="")],
                                note="Drift and lag are feed-forward from simulation truth; the trim learns what the lag model misses. "
                                     "A real robot has no truth: drivers trim by eye or with a heading LED.")], [])
 
@@ -383,6 +421,9 @@ def to_html(d):
     ]
     for section in d.sections:
         parts.append(f"<div style='color:#76d5f7; font-weight:700; margin-top:8px'>{section.title}</div>")
+        if section.why:
+            parts.append(f"<div style='color:#b3c2d3; font-style:italic; font-size:11px; margin-bottom:3px'>"
+                         f"Why: {section.why}</div>")
         if section.inputs:
             parts.append("<table cellspacing='0' cellpadding='1' style='font-size:12px'>")
             for symbol, value, source in section.inputs:

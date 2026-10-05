@@ -13,9 +13,9 @@ from pathlib import Path
 from PySide6.QtCore import QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QAction, QCloseEvent
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QDialog, QFileDialog, QFormLayout, QFrame, QHBoxLayout,
-    QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QScrollArea,
-    QSizePolicy, QSlider, QSplitter, QTabWidget, QVBoxLayout, QWidget,
+    QApplication, QButtonGroup, QCheckBox, QDialog, QFileDialog, QFormLayout, QFrame, QHBoxLayout,
+    QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea,
+    QSizePolicy, QSlider, QSplitter, QStackedWidget, QTabWidget, QVBoxLayout, QWidget,
 )
 
 try:
@@ -24,6 +24,7 @@ except ImportError as exc:  # pragma: no cover - exercised by launch failure
     raise SystemExit("melty_sim was not found. Build it and set PYTHONPATH=build/python") from exc
 
 from . import config_codec
+from .flow_diagram import FlowDiagram
 from .widgets import ArenaWidget, DirectionDial, TelemetryPlot
 from .steering import WorldSteering
 from .worker import SimulationWorker
@@ -41,6 +42,11 @@ FAULTS = (
     ("PHASE INVALID", native.Fault.PHASE_INVALID),
     ("HAL ERROR", native.Fault.HAL_ERROR),
 )
+
+PRESET_DIR = Path(__file__).resolve().parents[1] / "config"
+
+# Minimum change in the steering-corrected direction before it is re-sent.
+STEERING_RESEND_DEG = 0.5
 
 # Spin demand is capped to this fraction of what the accelerometer can measure.
 SPIN_SENSOR_MARGIN = 0.9
@@ -184,6 +190,9 @@ class MainWindow(QMainWindow):
         self.state_label = QLabel("SIM PAUSED"); self.state_label.setObjectName("state_badge"); toolbar.addWidget(self.state_label)
         spacer = QWidget(); spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         toolbar.addWidget(spacer)
+        self.presets_button = QPushButton("PRESETS"); self.presets_button.setObjectName("presets_button")
+        self.presets_button.setToolTip("Load a robot configuration, including failure-mode demonstrations.")
+        toolbar.addWidget(self.presets_button)
         self.settings_button = QPushButton("⚙  SETTINGS"); self.settings_button.setObjectName("settings_button")
         self.settings_button.setToolTip("Robot, sensor, firmware and simulation configuration, and presets.")
         self.settings_button.clicked.connect(self._show_settings); toolbar.addWidget(self.settings_button)
@@ -208,6 +217,9 @@ class MainWindow(QMainWindow):
     def _side_panel(self):
         body = QWidget(); layout = QVBoxLayout(body)
         title = QLabel("LIVE CONTROLS"); title.setObjectName("section_title"); layout.addWidget(title)
+        self.preset_label = QLabel(); self.preset_label.setObjectName("preset_note")
+        self.preset_label.setTextFormat(Qt.TextFormat.RichText); self.preset_label.setWordWrap(True)
+        self.preset_label.hide(); layout.addWidget(self.preset_label)
         form = QFormLayout()
         self.spin_slider = QSlider(Qt.Orientation.Horizontal); self.spin_slider.setRange(0, 1000)
         self.spin_slider.setToolTip("Spin demand as a fraction of the firmware's maximum spin.\n"
@@ -261,8 +273,22 @@ class MainWindow(QMainWindow):
         self.steering_check.toggled.connect(self._steering_toggled)
         layout.addWidget(self.steering_check)
 
-        title = QLabel("TELEMETRY"); title.setObjectName("section_title"); layout.addWidget(title)
-        self.telemetry = TelemetryPlot(); self.telemetry.setMinimumHeight(200); layout.addWidget(self.telemetry)
+        header = QHBoxLayout()
+        title = QLabel("TELEMETRY"); title.setObjectName("section_title"); header.addWidget(title)
+        header.addStretch()
+        self.mode_buttons = QButtonGroup(self)
+        for index, (label, tip) in enumerate((
+                ("TELEMETRY", "Plot and readouts."),
+                ("FLOWCHART", "Block diagram of the control loop with live values on every block and signal.\n"
+                              "Hover a block for what it does; click it to open the matching math."))):
+            button = QPushButton(label); button.setCheckable(True); button.setToolTip(tip)
+            button.setObjectName("mode_button"); button.setChecked(index == 0)
+            self.mode_buttons.addButton(button, index); header.addWidget(button)
+        layout.addLayout(header)
+        self.telemetry_stack = QStackedWidget()
+        self.mode_buttons.idToggled.connect(lambda index, on: on and self._set_telemetry_mode(index))
+        readouts = QWidget(); readouts_layout = QVBoxLayout(readouts); readouts_layout.setContentsMargins(0, 0, 0, 0)
+        self.telemetry = TelemetryPlot(); self.telemetry.setMinimumHeight(200); readouts_layout.addWidget(self.telemetry)
         grid = QFormLayout()
         self.actual_spin = QLabel("0.0 rad/s"); self.estimated_spin = QLabel("0.0 rad/s")
         self.phase = QLabel("0.0 rad"); self.acceleration = QLabel("0.0, 0.0 m/s²")
@@ -285,7 +311,12 @@ class MainWindow(QMainWindow):
                               ("Runtime", self.armed_status), ("Faults", self.faults)):
             name = QLabel(label); name.setToolTip(hints[label]); widget.setToolTip(hints[label])
             grid.addRow(name, widget)
-        layout.addLayout(grid)
+        readouts_layout.addLayout(grid); readouts_layout.addStretch()
+        self.telemetry_stack.addWidget(readouts)
+        self.flow_diagram = FlowDiagram(); self.flow_diagram.setObjectName("flow_diagram")
+        self.flow_diagram.block_clicked.connect(self._open_vector)
+        self.telemetry_stack.addWidget(self.flow_diagram)
+        layout.addWidget(self.telemetry_stack)
         self.record_button = QPushButton("START RECORDING"); self.record_button.setCheckable(True)
         self.record_button.setToolTip("Write this epoch's telemetry to CSV plus a JSON metadata file.")
         self.record_button.toggled.connect(self._toggle_recording); layout.addWidget(self.record_button)
@@ -328,6 +359,19 @@ class MainWindow(QMainWindow):
     def _show_settings(self):
         self.settings_dialog.show(); self.settings_dialog.raise_(); self.settings_dialog.activateWindow()
 
+    def _set_telemetry_mode(self, index):
+        self.telemetry_stack.setCurrentIndex(index)
+        self._refresh_flow()
+
+    def _open_vector(self, key):
+        if not self.vectors_check.isChecked():
+            self.vectors_check.setChecked(True)
+        self.arena.select(key)
+
+    def _refresh_flow(self):
+        self.flow_diagram.set_state(self.snapshot, self.config, self.steering.state,
+                                    self.spin_slider.value() / 1000.0)
+
     def _dial_changed(self, angle_deg, strength):
         self.direction_slider.blockSignals(True); self.direction_slider.setValue(round(angle_deg * 10))
         self.direction_slider.blockSignals(False)
@@ -346,9 +390,24 @@ class MainWindow(QMainWindow):
         return scroll
 
     def _menu(self):
-        menu = self.menuBar().addMenu("Preset")
+        menu = QMenu(self)
+        builtins = sorted(PRESET_DIR.glob("*.json"), key=lambda path: (path.stem.startswith("failure_"), path.stem))
+        failures_started = False
+        for path in builtins:
+            try:
+                title = config_codec.metadata(json.loads(path.read_text(encoding="utf-8")))["title"] or path.stem
+            except (OSError, json.JSONDecodeError, ValueError):
+                continue
+            if path.stem.startswith("failure_") and not failures_started:
+                failures_started = True
+                menu.addSection("Failure modes")
+            action = QAction(title, self)
+            action.triggered.connect(lambda _=False, preset=path: self._apply_preset_file(preset))
+            menu.addAction(action)
+        menu.addSeparator()
         load = QAction("Load…", self); load.triggered.connect(self._load_preset); menu.addAction(load)
         save = QAction("Save…", self); save.triggered.connect(self._save_preset); menu.addAction(save)
+        self.presets_button.setMenu(menu)
 
     def _populate_editors(self, document):
         c, s = document["config"], document["initial_state"]
@@ -423,8 +482,11 @@ class MainWindow(QMainWindow):
         command.translate_y = strength * math.sin(sent)
         command.arm = self.arm_button.isChecked()
         previous = self.command
-        changed = force or any(abs(getattr(command, name) - getattr(previous, name)) > 2e-3
-                               for name in ("spin", "translate_x", "translate_y"))
+        # Steering re-sends from snapshots only when the sent direction moves
+        # noticeably; every send is a recorded command event.
+        old_angle = math.atan2(previous.translate_y, previous.translate_x)
+        moved = abs(math.remainder(sent - old_angle, 2 * math.pi)) > math.radians(STEERING_RESEND_DEG)
+        changed = force or abs(command.spin - previous.spin) > 1e-6 or (strength > 0 and moved)
         self.arena.set_steering(self.steering.state)
         if not changed:
             return
@@ -491,11 +553,11 @@ class MainWindow(QMainWindow):
         if s.firmware.armed:
             self._last_disarm = None
         elif self._was_armed and self.arm_button.isChecked():
-            causes = [name for name in active if name != "PHASE INVALID"]
-            if not causes and s.sensed_acceleration.saturated:
-                causes = ["ACCELERATION SATURATED"]
-            reason = " · ".join(causes) if causes else "a transient fault"
-            self._last_disarm = f"Disarmed by {reason} at t = {s.time_us / 1e6:.2f} s"
+            # The simulator latches the fault mask at the disarming tick.
+            latched = int(s.last_disarm_faults)
+            causes = [name for name, fault in FAULTS if latched & int(fault) and name != "PHASE INVALID"]
+            reason = " · ".join(causes) if causes else "the arm request"
+            self._last_disarm = f"Disarmed by {reason} at t = {s.last_disarm_us / 1e6:.3f} s"
             if "ACCELERATION SATURATED" in causes:
                 self._last_disarm += (f" (spin {abs(s.spin_rad_s):.0f} rad/s exceeded the accelerometer's "
                                       f"{self.config.sensor.max_acceleration_mps2:.0f} m/s² range)")
@@ -526,6 +588,7 @@ class MainWindow(QMainWindow):
         self.arena.set_snapshot(s); self.telemetry.add_snapshot(s)
         self.direction_dial.set_velocity(s.vx_mps, s.vy_mps)
         self._send_command(force=False)  # keep the steering correction current
+        self._refresh_flow()
         self.time_label.setText(f"  t = {s.time_us / 1e6:.3f} s  ")
         self.actual_spin.setText(f"{s.spin_rad_s:+.2f} rad/s")
         self.estimated_spin.setText(f"{s.firmware.controller.spin_rad_s:+.2f} rad/s")
@@ -670,11 +733,23 @@ class MainWindow(QMainWindow):
     def _load_preset(self):
         path, _ = QFileDialog.getOpenFileName(self, "Load preset", "", "JSON (*.json)")
         if not path: return
+        self._apply_preset_file(path)
+
+    def _apply_preset_file(self, path):
+        """Load a preset, apply it, and adopt its UI settings and description."""
         try:
-            config, state = config_codec.load(native, path)
-            self._populate_editors(config_codec.to_document(config, state))
-            self.apply_requested.emit(config, state)
-        except (OSError, json.JSONDecodeError, ValueError) as exc: self._show_error(str(exc))
+            config, state, meta = config_codec.load_preset(native, path)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            self._show_error(str(exc)); return
+        self._populate_editors(config_codec.to_document(config, state))
+        ui = meta["ui"]
+        self.steering_check.setChecked(ui.get("world_aligned_steering", True))
+        self.spin_limit_check.setChecked(ui.get("limit_spin_to_sensor", True))
+        self.apply_requested.emit(config, state)
+        title = meta["title"] or Path(path).stem
+        self.preset_label.setText(f"<b>{title}</b>" + (f"<br>{meta['description']}" if meta["description"] else ""))
+        self.preset_label.show()
+        self.statusBar().showMessage(f"Loaded preset: {title}", 5000)
 
     def _save_preset(self):
         path, _ = QFileDialog.getSaveFileName(self, "Save preset", "robot-scenario.json", "JSON (*.json)")
@@ -711,6 +786,9 @@ QTabBar::tab:selected { background:#29435e; color:#76d5f7; } QLabel#section_titl
 QLabel#hint { color:#7f91a8; } QLabel#faults[active="true"] { color:#ff718d; font-weight:700; }
 QScrollArea#math_overlay { background:rgba(14,21,32,240); border:1px solid #38516d; border-radius:6px; }
 QLabel#math_overlay_text { background:transparent; padding:10px; }
+QLabel#preset_note { background:#1a2638; border-left:3px solid #ffd166; padding:8px; color:#c9d6e5; }
+QPushButton#mode_button { padding:4px 10px; font-size:11px; }
+QPushButton#mode_button:checked { background:#29435e; border-color:#76d5f7; color:#76d5f7; }
 QLabel#state_badge { color:#76d5f7; font-weight:700; padding-left:10px; } QMenuBar,QMenu { background:#111925; }
 """
 

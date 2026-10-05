@@ -102,6 +102,10 @@ struct Snapshot {
   // Inputs firmware consumed on its most recent control tick.
   AccelerationSample consumed_acceleration{};
   RcCommand consumed_command{};
+  // Time and fault mask of the most recent armed→disarmed transition, latched
+  // because faults such as saturation can clear on the very next tick.
+  Micros last_disarm_us{0};
+  Fault last_disarm_faults{Fault::none};
 };
 
 class Simulator {

@@ -41,7 +41,9 @@ class SimulationWorker(QObject):
             self._timer = QTimer(self)
             self._timer.destroyed.connect(self.timer_destroyed)
             self._timer.setTimerType(Qt.TimerType.PreciseTimer)
-            self._timer.setInterval(4)
+            # 10 ms keeps wakeups (and GIL hand-offs with the UI thread) modest;
+            # fractional time accumulates, so the pace is unaffected.
+            self._timer.setInterval(10)
             self._timer.timeout.connect(self._pump)
             self._timer.start()
             self._emit_snapshot()

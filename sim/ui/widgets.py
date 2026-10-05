@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import math
+import time
 from collections import deque
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QLabel, QScrollArea, QToolTip, QWidget
 
 from . import vector_math
@@ -42,8 +43,15 @@ class ArenaWidget(QWidget):
         self.overlay_text.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         self.overlay.setWidget(self.overlay_text)
         self.overlay.hide()
+        self._overlay_html = ""
+        self._overlay_shape = None
+        self._overlay_refreshed = 0.0
 
-    OVERLAY_WIDTH = 470
+    # Rich-text layout is the most expensive thing the UI does (~10 ms), so the
+    # live overlay refreshes at a reading pace rather than at the frame rate.
+    OVERLAY_REFRESH_S = 0.125
+
+    OVERLAY_WIDTH = 520
 
     def set_show_vectors(self, show):
         self.show_vectors = bool(show)
@@ -53,15 +61,28 @@ class ArenaWidget(QWidget):
 
     def select(self, key):
         self.selected = key
-        self._refresh_overlay()
+        self._refresh_overlay(force=True)
         self.update()
 
-    def _refresh_overlay(self):
+    def _refresh_overlay(self, force=False):
         if self.selected is None or self.snapshot is None or self.config is None:
             self.overlay.hide()
             return
-        self.overlay_text.setText(vector_math.to_html(vector_math.derive(self.selected, self.snapshot, self.config, self.steering)))
-        self._place_overlay()
+        now = time.monotonic()
+        if not force and now - self._overlay_refreshed < self.OVERLAY_REFRESH_S:
+            return
+        self._overlay_refreshed = now
+        html = vector_math.to_html(vector_math.derive(self.selected, self.snapshot, self.config, self.steering))
+        if html == self._overlay_html and not force:
+            return
+        self._overlay_html = html
+        self.overlay_text.setText(html)
+        # Re-measure only when the derivation's shape changes (rows, sections),
+        # not when its numbers tick.
+        shape = (self.selected, html.count("<tr>"), html.count("<div"), self.width(), self.height())
+        if force or shape != self._overlay_shape:
+            self._overlay_shape = shape
+            self._place_overlay()
         self.overlay.show()
 
     def _place_overlay(self):
@@ -72,6 +93,7 @@ class ArenaWidget(QWidget):
 
     def resizeEvent(self, event):
         if self.overlay.isVisible():
+            self._overlay_shape = None
             self._place_overlay()
         super().resizeEvent(event)
 
@@ -133,7 +155,7 @@ class ArenaWidget(QWidget):
     def set_config(self, config):
         self.config = config
         self.trail.clear()
-        self._refresh_overlay()
+        self._refresh_overlay(force=True)
         self.update()
 
     def set_snapshot(self, snapshot):
@@ -215,9 +237,8 @@ class ArenaWidget(QWidget):
             p.setPen(QColor("#8090a6")); p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "WAITING FOR SIMULATOR")
             return
         if len(self.trail) > 1:
-            path = QPainterPath(world(*self.trail[0]))
-            for point in list(self.trail)[1:]: path.lineTo(world(*point))
-            p.setPen(QPen(QColor("#267fb7"), 2)); p.drawPath(path)
+            p.setPen(QPen(QColor("#267fb7"), 2))
+            p.drawPolyline(QPolygonF([world(x_m, y_m) for x_m, y_m in self.trail]))
         s, cfg = self.snapshot, self.config
         center = world(s.x_m, s.y_m)
         radius = max(14.0, cfg.physical.body_radius_m * scale)
@@ -230,6 +251,10 @@ class ArenaWidget(QWidget):
         p.setPen(QPen(QColor("#f5a44c"), 5))
         p.drawLine(QPointF(-wheel_offset, -wheel_r), QPointF(-wheel_offset, wheel_r))
         p.drawLine(QPointF(wheel_offset, -wheel_r), QPointF(wheel_offset, wheel_r))
+        # Wheel labels are placed in body coordinates but drawn upright later.
+        wheel_labels = [(letter, p.transform().map(QPointF(x, 0)), color) for letter, x, color in
+                        (("A", wheel_offset + wheel_r + 9, vector_math.COLORS["wheel_a"]),
+                         ("B", -wheel_offset - wheel_r - 9, vector_math.COLORS["wheel_b"]))]
         sensor_r = cfg.sensor.radius_m * scale
         angle = cfg.sensor.angle_rad
         # Sensor position is fixed on body +X. angle_rad rotates only its axes.
@@ -269,6 +294,11 @@ class ArenaWidget(QWidget):
             net = (s.wheel_a.applied_force_n - s.wheel_b.applied_force_n) / limit * full
             self._vector(p, "net_force", QPointF(0, 0), QPointF(0, -net), 3)
         p.restore()
+        bold = p.font(); bold.setBold(True); p.setFont(bold)
+        for letter, position, color in wheel_labels:
+            p.setPen(QColor(color))
+            p.drawText(QRectF(position.x() - 8, position.y() - 9, 16, 18), Qt.AlignmentFlag.AlignCenter, letter)
+        bold.setBold(False); p.setFont(bold)
         if self.show_vectors:
             # World-frame chassis velocity; 1 m/s spans 200 px, with a 30 px
             # floor so slow drift stays visible and hoverable.
@@ -342,7 +372,8 @@ class TelemetryPlot(QWidget):
         self.samples.append((s.time_us / 1e6, s.spin_rad_s,
                              s.firmware.controller.spin_rad_s,
                              s.firmware.output.wheel_a, s.firmware.output.wheel_b))
-        self.update()
+        if self.isVisible():
+            self.update()
 
     def clear(self):
         self.samples.clear(); self.update()
@@ -358,20 +389,22 @@ class TelemetryPlot(QWidget):
         samples = list(self.samples); t0, t1 = samples[0][0], samples[-1][0]
         span = max(0.001, t1 - t0)
         max_spin = max(10.0, max(abs(v) for row in samples for v in row[1:3]) * 1.1)
+        # At most ~one point per two pixels; more is invisible but costs paint time.
+        stride = max(1, math.ceil(len(samples) / max(2.0, area.width() / 2)))
+        shown = samples[::stride] if samples[-1] is samples[::stride][-1] else samples[::stride] + [samples[-1]]
+        left, width = area.left(), area.width()
+        middle, half = area.center().y(), area.height() * 0.46
+        xs = [left + (row[0] - t0) / span * width for row in shown]
         def line(index, color, scale):
-            path = QPainterPath()
-            for i, row in enumerate(samples):
-                x = area.left() + (row[0] - t0) / span * area.width()
-                y = area.center().y() - row[index] / scale * area.height() * 0.46
-                (path.moveTo if i == 0 else path.lineTo)(x, y)
-            p.setPen(QPen(QColor(color), 2)); p.drawPath(path)
+            p.setPen(QPen(QColor(color), 2))
+            p.drawPolyline(QPolygonF([QPointF(x, middle - row[index] / scale * half) for x, row in zip(xs, shown)]))
         line(1, "#58c7f3", max_spin); line(2, "#ef5da8", max_spin)
-        line(3, "#f5a44c", 1.0); line(4, "#8bd17c", 1.0)
+        line(3, vector_math.COLORS["wheel_a"], 1.0); line(4, "#8bd17c", 1.0)
         p.setPen(QColor("#91a2b8")); p.drawText(48, self.height() - 10, f"{t0:.1f} s")
         p.drawText(self.width() - 78, self.height() - 10, f"{t1:.1f} s")
         x = 58
         for text, color in (("actual spin", "#58c7f3"), ("estimated spin", "#ef5da8"),
-                            ("wheel A", "#f5a44c"), ("wheel B", "#8bd17c")):
+                            ("wheel A", vector_math.COLORS["wheel_a"]), ("wheel B", "#8bd17c")):
             p.setPen(QColor(color)); p.drawText(x, 20, text)
             x += p.fontMetrics().horizontalAdvance(text) + 16
 
